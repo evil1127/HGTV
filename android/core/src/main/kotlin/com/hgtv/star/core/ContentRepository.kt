@@ -47,7 +47,8 @@ data class SearchSuggestion(
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
+/** [backups]：同一份资源的备用 CDN 地址（`backup_url_1` 等），主地址读不动时依次换用。 */
+data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val backups: List<String> = emptyList())
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 /**
  * 这个请求需要登录态，而本机还没有可用的凭据（或凭据已失效）。
@@ -1176,9 +1177,16 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val item=selected.third; var url=cleanUrl(item.str("main_url")); val seed=info.str("key_seed")
         if(seed.isNotEmpty()) url=MediaCrypto.decryptUrl(url,decode64(seed))
         if(!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
+        val backups=(1..3).mapNotNull { n ->
+            runCatching {
+                var backup=cleanUrl(item.str("backup_url_$n"))
+                if(backup.isNotEmpty() && seed.isNotEmpty()) backup=MediaCrypto.decryptUrl(backup,decode64(seed))
+                backup.takeIf { (it.startsWith("https://") || it.startsWith("http://")) && it!=url }
+            }.getOrNull()
+        }.distinct()
         val key=item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
         val quality=if(selected.first>0) "${selected.first}P"+(if(selected.first>maxQuality) "（兼容资源）" else "") else "自动"
-        return StreamInfo(url,key,quality)
+        return StreamInfo(url,key,quality,backups)
     }
     /**
      * 取一集的弹幕，也就是「原 App」播放时看到的同一份数据。

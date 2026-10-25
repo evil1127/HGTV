@@ -22,10 +22,49 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo, private 
     val cacheable: Boolean get() = store?.broken==false
     /** 整集原始字节都已在本地磁盘上。 */
     val complete: Boolean get() = store?.complete==true
+    /**
+     * 播放地址是有时效的 CDN 直链：预载的那几集可能放了几分钟才开播，中途地址就过期了。
+     * 给了 [refresh] 时，分段读取失败会重新取一次地址（同一集、同一清晰度）再试；
+     * 新地址的密钥或总长度对不上（换成了另一份资源）就照常报错。
+     */
+    @Volatile var refresh: (()->StreamInfo)?=null
+    @Volatile var log: ((String)->Unit)?=null
+    @Volatile private var source: StreamInfo=info
+    private val renewLock=Any()
+    private var renewedAt=0L
     private fun range(start: Long,end: Long): Range {
+        val used=source
+        try { return fetch(used.url,start,end) } catch(problem: IOException) {
+            if(closed) throw problem
+            // 先换同一份资源的备用 CDN 地址（不用重新取地址，立刻就能试）。
+            for(alternate in used.backups) {
+                if(closed) throw problem
+                try {
+                    val result=fetch(alternate,start,end)
+                    synchronized(renewLock) { if(source===used) source=used.copy(url=alternate,backups=used.backups.filter { it!=alternate }+used.url) }
+                    log?.invoke("Stream switched to backup after ${problem.javaClass.simpleName}: ${problem.message}")
+                    return result
+                } catch(_: IOException) {}
+            }
+            val renewer=refresh ?: throw problem
+            val next=synchronized(renewLock) {
+                if(source!==used) source else {
+                    val now=System.currentTimeMillis()
+                    if(now-renewedAt<5_000) throw problem
+                    renewedAt=now
+                    log?.invoke("Stream renew after ${problem.javaClass.simpleName}: ${problem.message}")
+                    val fresh=renewer()
+                    if(!java.util.Arrays.equals(fresh.key,info.key)) throw IOException("播放地址续期后资源不同")
+                    source=fresh; fresh
+                }
+            }
+            return fetch(next.url,start,end)
+        }
+    }
+    private fun fetch(url: String,start: Long,end: Long): Range {
         if(closed) throw IOException("播放请求已取消")
         require(start>=0 && end>=start && end-start<8*1024*1024)
-        val request=Request.Builder().url(info.url).header("User-Agent",VendorConstants.VIDEO_UA).header("Referer","https://novel.snssdk.com/").header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
+        val request=Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Referer","https://novel.snssdk.com/").header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
         val call=http.newCall(request)
         synchronized(calls) { if(closed) throw IOException("播放请求已取消"); calls+=call }
         try {
