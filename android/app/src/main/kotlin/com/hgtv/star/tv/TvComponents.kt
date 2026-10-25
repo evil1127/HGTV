@@ -282,7 +282,7 @@ internal open class TvButton(
         maxLines = 1
         ellipsize = TextUtils.TruncateAt.END
         isFocusable = true
-        isFocusableInTouchMode = true
+        isFocusableInTouchMode = false // 触控 / 鼠标点一下就执行（为 true 时第一下只拿焦点，要点两下）
         id = View.generateViewId()
         paint(false)
         setOnClickListener { action() }
@@ -338,7 +338,7 @@ internal class IconButton(
 
     init {
         isFocusable = true
-        isFocusableInTouchMode = true
+        isFocusableInTouchMode = false // 触控 / 鼠标点一下就执行（为 true 时第一下只拿焦点，要点两下）
         id = View.generateViewId()
         contentDescription = contentLabel
         icon.setImageResource(iconRes)
@@ -478,7 +478,7 @@ internal class PosterCard(
         clipChildren = false
         clipToPadding = false
         isFocusable = true
-        isFocusableInTouchMode = true
+        isFocusableInTouchMode = false // 触控 / 鼠标点一下就执行（为 true 时第一下只拿焦点，要点两下）
         id = View.generateViewId()
         setPadding(band, band, band, band)
 
@@ -710,7 +710,7 @@ internal class EpisodeCell(
         gravity = Gravity.CENTER
         applyTitleStyle()
         isFocusable = true
-        isFocusableInTouchMode = true
+        isFocusableInTouchMode = false // 触控 / 鼠标点一下就执行（为 true 时第一下只拿焦点，要点两下）
         id = View.generateViewId()
         minimumHeight = dp(TvStyle.BUTTON_NORMAL + 2 * TvStyle.SOFT_BAND)
         paint(false)
