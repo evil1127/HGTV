@@ -9,7 +9,9 @@ android {
     namespace = "com.hgtv.star"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.hgtv.star"
+        // 预载版（.github/workflows/build-preload.yml）用另一个包名与名称打包，可以和正式版并存。
+        applicationId = System.getenv("HGTV_APPLICATION_ID") ?: "com.hgtv.star"
+        manifestPlaceholders["appLabel"] = System.getenv("HGTV_APP_LABEL") ?: "红果TV"
         minSdk = 19
         // 钉在 29：这是**传统存储模式**（`requestLegacyExternalStorage`）还能生效的最高版本，
         // 而传统模式下一个 `WRITE_EXTERNAL_STORAGE` 就等于整个 `/sdcard` 的读写权——
