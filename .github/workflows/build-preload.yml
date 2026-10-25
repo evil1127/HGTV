@@ -1,0 +1,38 @@
+name: Build preload APK
+
+# 预载版（预先下载当前集 + 后面 3 集）的打包流程：推送或手动触发都会打一个可安装的 APK，
+# 放在这次运行的 Artifacts 里下载。包名 com.hgtv.star.preload，和正式版并存，不会覆盖。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      HGTV_APPLICATION_ID: com.hgtv.star.preload
+      HGTV_APP_LABEL: 红果TV 预载版
+      # 版本号拉高，避免应用内更新拿上游正式版来提示（上游包名不同，本来也装不上）。
+      HGTV_VERSION_CODE: '90000'
+      HGTV_VERSION_NAME: 1.2.4-preload
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: 安装 SDK 组件
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: 单元测试 + 打包
+        run: ./android/gradlew -p android :core:test :app:assembleDebug --console=plain
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGTV-preload-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
