@@ -30,6 +30,15 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo, private 
     @Volatile var refresh: (()->StreamInfo)?=null
     @Volatile var log: ((String)->Unit)?=null
     @Volatile private var source: StreamInfo=info
+    /**
+     * 读视频分段专用的短超时：CDN 主地址卡住时 5～6 秒就放弃、换备用地址，
+     * 而不是等内容接口那套 30～45 秒。与 [http] 共用连接池与调度器。
+     */
+    private val videoHttp: OkHttpClient=http.newBuilder()
+        .connectTimeout(5,java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(6,java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(25,java.util.concurrent.TimeUnit.SECONDS)
+        .build()
     private val renewLock=Any()
     private var renewedAt=0L
     private fun range(start: Long,end: Long): Range {
@@ -65,7 +74,7 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo, private 
         if(closed) throw IOException("播放请求已取消")
         require(start>=0 && end>=start && end-start<8*1024*1024)
         val request=Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Referer","https://novel.snssdk.com/").header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
-        val call=http.newCall(request)
+        val call=videoHttp.newCall(request)
         synchronized(calls) { if(closed) throw IOException("播放请求已取消"); calls+=call }
         try {
             return RequestScope.execute(call) { response ->
