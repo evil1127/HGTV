@@ -27,6 +27,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: 安装 SDK 组件
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
       - name: 单元测试 + 打包
