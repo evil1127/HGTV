@@ -46,7 +46,8 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo, private 
         if(::prepared.isInitialized) return this
         val first=range(0,256*1024-1); total=first.total
         prefix=first.bytes
-        if(cacheFile!=null && !closed) store=runCatching { RawStore(cacheFile,total).also { it.offer(0,first.bytes) } }.getOrNull()
+        val file=cacheFile
+        if(file!=null && !closed) store=runCatching { RawStore(file,total).also { it.offer(0,first.bytes) } }.getOrNull()
         if(closed) { store?.close(); store=null }
         try {
             val end=MediaCrypto.headerEnd(first.bytes,total)
