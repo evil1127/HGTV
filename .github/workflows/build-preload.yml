@@ -31,6 +31,15 @@ jobs:
           packages: platform-tools
       - name: 安装 SDK 组件
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: 固定签名（有 HGTV_PRELOAD_KEYSTORE 这个 secret 时，每次打包签名都相同，可直接覆盖安装）
+        env:
+          KEYSTORE_B64: ${{ secrets.HGTV_PRELOAD_KEYSTORE }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then echo "::warning::没有设置 HGTV_PRELOAD_KEYSTORE，本次用随机签名（无法覆盖安装旧版）"; exit 0; fi
+          mkdir -p ~/.android
+          echo "$KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+          if [ -n "${ANDROID_USER_HOME:-}" ]; then mkdir -p "$ANDROID_USER_HOME"; cp ~/.android/debug.keystore "$ANDROID_USER_HOME/debug.keystore"; fi
+          echo "已使用固定签名"
       - name: 单元测试 + 打包
         run: ./android/gradlew -p android :core:test :app:assembleRelease --console=plain
       - uses: actions/upload-artifact@v4
