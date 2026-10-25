@@ -70,8 +70,9 @@ dependencies {
     implementation("com.google.zxing:core:3.4.1")
     implementation("com.squareup.okhttp3:okhttp:3.12.13")
     implementation(project(":core")) { exclude(group = "org.json") }
-    implementation("com.google.android.exoplayer:exoplayer-core:2.19.1")
-    implementation("com.google.android.exoplayer:exoplayer-ui:2.19.1")
+    // 源码用的是 androidx.media3 的包名；1.1.1 与 ExoPlayer 2.19.1 同代，仍支持 Android 4.4（API 19）。
+    implementation("androidx.media3:media3-exoplayer:1.1.1")
+    implementation("androidx.media3:media3-ui:1.1.1")
     // 友盟：统计 + APM（崩溃 / ANR / 性能）。`common` 与 `asms` 用 `+` 是官方建议的写法，
     // `apm` 钉版本（1.9.13 是本项目验证过的那一版）。
     implementation("com.umeng.umsdk:common:+")
