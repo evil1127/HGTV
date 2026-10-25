@@ -77,8 +77,10 @@ internal fun MainActivity.playEpisode(index: Int,position: Long=0,autoplay: Bool
     val reuse=screen=="player" && player!=null && playerView!=null && !recovering && !playError
     library.setWatched(data.series.id,false)
     val selectedIndex=index.coerceIn(0,data.episodes.lastIndex)
-    val prefetched=if(position==0L && !recovering) preparedNext.take("${data.episodes[selectedIndex]}:${library.maxQuality}") else null
-    val claimedHttp=if(prefetched!=null) prefetchHttp.also { prefetchHttp=null } else null
+    // 已预先下载（或至少预热）的这一集：只在从头播时接手，续播 / 恢复走现取。
+    val claimed=if(position==0L && !recovering) preloaded.take("${data.episodes[selectedIndex]}:${library.maxQuality}") else null
+    val prefetched=claimed?.video
+    val claimedHttp=claimed?.http
     // 无感切集：同一个播放器复用、目标是下一集的开头、而且下一集**已经预热好**
     //（播放地址 / moov / 首批数据都在本地，见 [maybePrefetch]）。
     // 这时切集不再走「停播放器 → 清空 → 重新取地址 → 重建画面」那条路：
@@ -92,7 +94,8 @@ internal fun MainActivity.playEpisode(index: Int,position: Long=0,autoplay: Bool
     saveProgress(); library.flush(); invalidatePage(); favoriteMonitor.stop(); releaseCatalogViews()
     dismissPlaybackMenu()
     if(reuse) {
-        cancelRecovery(); cancelPrefetch(); tvTools.close()
+        // 切集只暂停预载、不清空：后面已下好的几集留着，下一轮按新窗口保留（见 [maybePrefetch]）。
+        cancelRecovery(); pausePrefetch(); tvTools.close()
         episodePanel?.dismiss(); episodePanel=null; speedDialog?.dismiss(); speedDialog=null
         playerListener?.let { player?.removeListener(it) }; playerListener=null
         if(!seamless) { player?.stop(); player?.clearMediaItems() }
@@ -223,7 +226,7 @@ internal fun MainActivity.playEpisode(index: Int,position: Long=0,autoplay: Bool
         // 播放用的是**平台注册过的**设备身份（本机随机值已经不再参与签名）：
         // 注册还没落地时先补一次，免得取地址落到内置那份被拉黑的档案上。
         if(!library.deviceRegistered()) registerDeviceOnce()
-        prefetched ?: RemoteVideo(repository.http,repository.stream(requestedId,maxQuality)).prepare()
+        prefetched ?: RemoteVideo(repository.http,repository.stream(requestedId,maxQuality),newEpisodeCacheFile()).prepare()
     }, { remote ->
         video=remote; quality=remote.info.quality
         val p=player ?: run {

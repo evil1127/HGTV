@@ -70,43 +70,87 @@ internal fun MainActivity.retirePreviousEpisode() {
     retiringVideo=null
     closeTransport(retiringHttp); retiringHttp=null
 }
-internal fun MainActivity.cancelPrefetch() {
-    prefetchScope?.cancel(); prefetchScope=null
-    preparedNext.clear(); prefetchJob?.cancel(true); prefetchJob=null
-    closeTransport(prefetchHttp); prefetchHttp=null; prefetchedFor=""
+/** 预先下载的集数（不含正在播的这一集）。 */
+internal const val PRELOAD_EPISODES=3
+/** 磁盘剩余空间低于这个值就不再落盘（退回只预热开头 1MB 的旧行为）。 */
+internal const val PRELOAD_MIN_FREE_BYTES=300L*1024*1024
+
+/** 预载好的一集：视频对象连同它专用的那条传输，一起交给播放器或一起回收。 */
+internal class PrefetchedEpisode(val video: RemoteVideo,val http: okhttp3.OkHttpClient,private val release: (okhttp3.OkHttpClient)->Unit): java.io.Closeable {
+    override fun close() { runCatching { video.close() }; release(http) }
 }
+internal fun MainActivity.episodeCacheDir()=java.io.File(cacheDir,"episodes")
+internal fun MainActivity.newEpisodeCacheFile(): java.io.File? = runCatching {
+    val dir=episodeCacheDir(); dir.mkdirs()
+    if(dir.usableSpace<PRELOAD_MIN_FREE_BYTES) null else java.io.File(dir,"${java.util.UUID.randomUUID()}.bin")
+}.getOrNull()
+
+/** 停掉在途的预载下载，但保留已经放上架的几集。 */
+internal fun MainActivity.pausePrefetch() {
+    prefetchScope?.cancel(); prefetchScope=null
+    prefetchJob?.cancel(true); prefetchJob=null
+}
+/** 全部作废：停下载，并关掉（删掉）已预载的几集。 */
+internal fun MainActivity.cancelPrefetch() {
+    pausePrefetch(); preloaded.clear()
+}
+/**
+ * 预先下载：当前这一集开播 3 秒后，后台单线程依次
+ *   1. 把**当前这一集**剩下的部分整集下载到磁盘；
+ *   2. 取后面 [PRELOAD_EPISODES] 集的播放地址，逐集整集下载到磁盘。
+ * 播放时 [RemoteVideo.read] 先读磁盘，网络慢也不卡；切到已下好的那集直接无感接上。
+ *
+ * 由每秒一次的 tick 调用。计量网络（手机热点）、定时停止后都不预载；关了自动连播只下当前这一集。
+ * 取地址的接口约一半概率回空响应：失败就停在那一集，15 秒后下一轮再试，每集最多 10 轮。
+ */
 internal fun MainActivity.maybePrefetch() {
     val p=player ?: return; val data=detail ?: return
-    if(!foreground || !p.isPlaying || !library.autoNext || playError || sleepStopped || episodeIndex>=data.episodes.lastIndex) return
-    if(!PrefetchPolicy.nearEnd(p.currentPosition,p.duration,p.playbackParameters.speed)) return
-    val id=data.episodes[episodeIndex+1]; val quality=library.maxQuality; val key="$id:$quality"
-    if(preparedNext.isFresh(key) || prefetchJob?.isDone==false) return
+    if(!foreground || !p.isPlaying || playError || sleepStopped) return
+    if(prefetchJob?.isDone==false) return
     val now=android.os.SystemClock.elapsedRealtime()
-    if(readySince==0L || now-readySince<3000 || p.bufferedPosition-p.currentPosition<5000) return
-    // 预取窗口只有 30 秒（见 [PrefetchPolicy.nearEnd]），而这条接口约一半概率回空响应：
-    // 窗口内要敢重发——6 秒一次、最多 5 次。以前是 15 秒 / 3 次，窗口里只来得及试两次，
-    // 两次都空就只能退回「切集时现取播放地址」那条慢路，用户看到的正是黑屏转圈。
-    if(prefetchAttempts>=5 || (prefetchAttempts>0 && now-prefetchAttemptAt<6_000) || connectivity.isActiveNetworkMetered || !networkAvailable()) return
-    cancelPrefetch(); prefetchedFor=key; prefetchAttemptAt=now; prefetchAttempts++
-    val ticket=preparedNext.begin(key)
-    val http=okhttp3.OkHttpClient.Builder().connectTimeout(8,java.util.concurrent.TimeUnit.SECONDS).readTimeout(15,java.util.concurrent.TimeUnit.SECONDS).callTimeout(20,java.util.concurrent.TimeUnit.SECONDS).build()
-    val source=ContentRepository(http); prefetchHttp=http
-    // 预取走的是另一个仓库实例：登录态与**设备身份 / 注册 Cookie**都要带过去，
-    // 少了后者它签名时只剩内置那份档案（`device_id` 被平台拉黑），
-    // 取播放地址一律空响应（见 ContentRepository.videoModel），这一集永远预取不到。
-    source.credentials=repository.credentials
-    source.inheritDevice(repository)
+    if(readySince==0L || now-readySince<3000) return
+    if(connectivity.isActiveNetworkMetered || !networkAvailable()) return
+    val quality=library.maxQuality
+    // 关了自动连播就只把当前这一集下完，不预载后面几集。
+    val last=if(library.autoNext) minOf(episodeIndex+PRELOAD_EPISODES,data.episodes.lastIndex) else episodeIndex
+    val window=(episodeIndex+1..last).map { data.episodes[it] to "${data.episodes[it]}:$quality" }
+    val current=video
+    val currentPending=current!=null && current.cacheable && !current.complete
+    val missing=window.filter { (_,key) -> preloaded.peek(key)?.video?.let { it.complete || !it.cacheable }!=true }
+    preloaded.retain(window.map { it.second }.toSet())
+    if(!currentPending && missing.isEmpty()) return
+    if(prefetchAttempts>=10 || (prefetchAttempts>0 && now-prefetchAttemptAt<15_000)) return
+    prefetchAttemptAt=now; prefetchAttempts++
+    val ticket=preloaded.generation()
     val scope=RequestScope(); prefetchScope=scope
+    val credentials=repository.credentials
+    val keepGoing={ !Thread.currentThread().isInterrupted }
     prefetchJob=prefetchWorker.submit {
-        var remote: RemoteVideo?=null
         try {
-            // 与 [playEpisode] 同一道门槛：预取也是取播放地址，同样按注册设备来。
-            if(!library.deviceRegistered()) { registerDeviceOnce(); source.inheritDevice(repository) }
-            val prepared=scope.run {
-                RemoteVideo(http,source.stream(id,quality)).also { remote=it; it.warm() }
+            if(currentPending) scope.run { current!!.download(keepGoing=keepGoing) }
+            for((id,key) in missing) {
+                if(Thread.currentThread().isInterrupted) break
+                val shelved=preloaded.peek(key)?.video
+                val remote: RemoteVideo
+                if(shelved!=null) remote=shelved
+                else {
+                    val http=okhttp3.OkHttpClient.Builder().connectTimeout(8,java.util.concurrent.TimeUnit.SECONDS).readTimeout(15,java.util.concurrent.TimeUnit.SECONDS).callTimeout(30,java.util.concurrent.TimeUnit.SECONDS).build()
+                    // 预取走的是另一个仓库实例：登录态与**设备身份 / 注册 Cookie**都要带过去，
+                    // 少了后者它签名时只剩内置那份档案（`device_id` 被平台拉黑），取播放地址一律空响应。
+                    val source=ContentRepository(http); source.credentials=credentials; source.inheritDevice(repository)
+                    var made: RemoteVideo?=null
+                    val created=try {
+                        if(!library.deviceRegistered()) { registerDeviceOnce(); source.inheritDevice(repository) }
+                        scope.run { RemoteVideo(http,source.stream(id,quality),newEpisodeCacheFile()).also { made=it; it.warm() } }
+                    } catch(problem: Exception) { made?.close(); closeTransport(http); throw problem }
+                    if(!preloaded.put(ticket,key,PrefetchedEpisode(created,http) { closeTransport(it) })) break
+                    remote=created
+                    android.util.Log.i("HGTV","Preload prepared $key")
+                }
+                if(remote.cacheable && !scope.run { remote.download(keepGoing=keepGoing) }) break
+                android.util.Log.i("HGTV","Preload complete $key")
             }
-            if(preparedNext.complete(ticket,key,prepared)) android.util.Log.i("HGTV","Next episode prepared near end")
-        } catch(_: Exception) { remote?.close() }
+        } catch(_: Exception) {}
     }
 }
 internal fun MainActivity.networkAvailable(): Boolean = connectivity.getNetworkCapabilities(connectivity.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)==true

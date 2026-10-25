@@ -94,12 +94,11 @@ class MainActivity: Activity() {
     internal val danmakuWorker=Executors.newSingleThreadExecutor()
     /** 每次换集自增；在途的弹幕请求发现 token 变了就立刻收手。 */
     internal val danmakuToken=java.util.concurrent.atomic.AtomicLong(0)
-    internal var prefetchHttp: okhttp3.OkHttpClient?=null
     internal var playbackHttp: okhttp3.OkHttpClient?=null
-    internal val preparedNext=PreparedSlot<RemoteVideo>({ android.os.SystemClock.elapsedRealtime() })
+    /** 预先下载好的后面几集（见 [maybePrefetch]）；整集落盘的不会过期。 */
+    internal val preloaded=PrefetchShelf<PrefetchedEpisode>({ android.os.SystemClock.elapsedRealtime() },{ it.video.complete })
     internal var prefetchJob: java.util.concurrent.Future<*>?=null
     internal var prefetchScope: RequestScope?=null
-    internal var prefetchedFor=""
     internal var readySince=0L
     /**
      * 无感切集（见 [playEpisode] 里的 `seamless`）：下一集已经预热好时，切集不清播放器，
@@ -716,6 +715,8 @@ class MainActivity: Activity() {
         mediaSession=TvMediaSession(this,{ if(foreground && screen=="player") requestPlayback(true) },{ if(foreground && screen=="player") requestPlayback(false) },{ position -> if(foreground && screen=="player") seekTo(position) },{ direction -> skipEpisode(direction) },{ if(foreground && screen=="player") returnToDetail() })
         message(base(),"正在读取本机记录…")
         loadLibrary()
+        // 上次没正常退出时留下的预载文件：启动时还没有任何视频在用，整目录清掉。
+        io.execute { runCatching { episodeCacheDir().listFiles()?.forEach { it.delete() } } }
     }
 
     /** 文件选择器回传：只登记 Uri，真正的读取与导入交给 [onResume] 末尾的 [consumePendingAccountFile]。 */
@@ -862,7 +863,8 @@ class MainActivity: Activity() {
         // 柔光位图是可重建的纯缓存，内存吃紧时先丢它。
         if(level>=android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) Soft.trim()
         if(::artwork.isInitialized) artwork.trimMemory(level)
-        if(level>=android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) cancelPrefetch()
+        // 预载的几集都在磁盘上（内存里每集只留 1MB 开头），内存吃紧时只暂停下载，不丢已下好的。
+        if(level>=android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) pausePrefetch()
     }
     override fun onDestroy() {
         generation++; cancelWork()
