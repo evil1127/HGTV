@@ -137,6 +137,17 @@ internal fun MainActivity.playEpisode(index: Int,position: Long=0,autoplay: Bool
         }
         danmakuView=overlay
         root.addView(overlay,FrameLayout.LayoutParams(-1,-1))
+        // 触控 / 鼠标：点画面叫出控制条，控制条开着时再点一下收起（出错界面不收，按钮要留着）。
+        // 单独一层透明的点按层：PlayerView 在不用自带控制器时不处理触摸，弹幕层隐藏时也接不到点击。
+        // 它压在画面与弹幕之上、标题条与底部控制条之下，控制条上的按钮仍然优先。
+        root.addView(View(this).apply {
+            isFocusable=false
+            importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setOnClickListener {
+                if(screen!="player") return@setOnClickListener
+                if(hud.visibility==View.VISIBLE && !panel && !playError) hidePlaybackOverlay() else showHud()
+            }
+        },FrameLayout.LayoutParams(-1,-1))
         // 顶部标题条：对齐爆米花 activity_player —— 整宽 96dp、50% 黑 → 透明，
         // 左侧 24sp 粗体剧名、右侧同字号时钟，左右安全边距 78dp。
         // 播放界面压在视频上，文字固定用暖白（TvStyle.playerText），不跟主题：
@@ -178,6 +189,23 @@ internal fun MainActivity.playEpisode(index: Int,position: Long=0,autoplay: Bool
         }
         transport.addView(transportIcon,lp(dp(43),dp(43)))
         progressBar=SeekIndicator(this)
+        // 触控 / 鼠标拖进度条：按下、拖动时只移动进度显示，放开才真正跳转（拖动中不反复 seek）。
+        progressBar.setOnTouchListener { bar,event ->
+            val duration=player?.duration ?: 0L
+            if(!playbackReady || duration<=0 || bar.width<=0) return@setOnTouchListener false
+            val fraction=(event.x/bar.width).coerceIn(0f,1f)
+            when(event.actionMasked) {
+                MotionEvent.ACTION_DOWN,MotionEvent.ACTION_MOVE -> {
+                    bar.parent?.requestDisallowInterceptTouchEvent(true)
+                    progressBar.progress=fraction; main.removeCallbacks(hideHud)
+                    playbackText.text="${formatSpan((duration*fraction).toLong())} / ${formatSpan(duration)}"
+                    true
+                }
+                MotionEvent.ACTION_UP -> { seekTo((duration*fraction).toLong()); true }
+                MotionEvent.ACTION_CANCEL -> { updatePlaybackText(); showHud(); true }
+                else -> false
+            }
+        }
         transport.addView(progressBar,lp(0,dp(43)).apply { weight=1f; leftMargin=dp(13); rightMargin=dp(26) })
         playbackText=text("",18f,TvStyle.playerText).apply { setShadowLayer(4f,0f,1f,0x80000000.toInt()) }
         transport.addView(playbackText,lp(-2,-2))
