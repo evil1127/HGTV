@@ -565,7 +565,7 @@ class HomeScreen(
         val band = context.softBand()
         val plate = FrameLayout(context).apply {
             isFocusable = true
-            isFocusableInTouchMode = true
+            isFocusableInTouchMode = false // 触控 / 鼠标点一下就执行（为 true 时第一下只拿焦点，要点两下）
             id = View.generateViewId()
             clipChildren = false
             clipToPadding = false
