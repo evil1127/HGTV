@@ -101,7 +101,7 @@ internal fun MainActivity.cancelPrefetch() {
  * 播放时 [RemoteVideo.read] 先读磁盘，网络慢也不卡；切到已下好的那集直接无感接上。
  *
  * 由每秒一次的 tick 调用。计量网络（手机热点）、定时停止后都不预载；关了自动连播只下当前这一集。
- * 取地址的接口约一半概率回空响应：失败就停在那一集，15 秒后下一轮再试，每集最多 10 轮。
+ * 取地址的接口约一半概率回空响应：当场重试；仍失败就先下后面几集，5 秒后下一轮再补。
  */
 internal fun MainActivity.maybePrefetch() {
     val p=player ?: return; val data=detail ?: return
@@ -119,38 +119,58 @@ internal fun MainActivity.maybePrefetch() {
     val missing=window.filter { (_,key) -> preloaded.peek(key)?.video?.let { it.complete || !it.cacheable }!=true }
     preloaded.retain(window.map { it.second }.toSet())
     if(!currentPending && missing.isEmpty()) return
-    if(prefetchAttempts>=10 || (prefetchAttempts>0 && now-prefetchAttemptAt<15_000)) return
+    if(prefetchAttempts>=20 || (prefetchAttempts>0 && now-prefetchAttemptAt<5_000)) return
     prefetchAttemptAt=now; prefetchAttempts++
     val ticket=preloaded.generation()
     val scope=RequestScope(); prefetchScope=scope
     val credentials=repository.credentials
     val keepGoing={ !Thread.currentThread().isInterrupted }
+    fun log(line: String)=android.util.Log.i("HGTV",line)
     prefetchJob=prefetchWorker.submit {
-        try {
-            if(currentPending) scope.run { current!!.download(keepGoing=keepGoing) }
-            for((id,key) in missing) {
-                if(Thread.currentThread().isInterrupted) break
-                val shelved=preloaded.peek(key)?.video
-                val remote: RemoteVideo
-                if(shelved!=null) remote=shelved
-                else {
+        // 1. 正在播的这一集：剩下的部分先下完（下不动也不影响后面几集）。
+        if(currentPending) try {
+            if(scope.run { current!!.download(keepGoing=keepGoing) }) log("Preload current complete episode=${episodeIndex+1}")
+        } catch(problem: Exception) { log("Preload current failed: ${problem.javaClass.simpleName} ${problem.message}") }
+        // 2. 后面几集按顺序来（下一集永远排第一）；某一集取不到地址或下载出错，
+        //    先去下后面那几集，下一轮（5 秒后）再回头补它。
+        for((id,key) in missing) {
+            if(Thread.currentThread().isInterrupted) break
+            try {
+                val remote=preloaded.peek(key)?.video ?: run {
                     val http=okhttp3.OkHttpClient.Builder().connectTimeout(8,java.util.concurrent.TimeUnit.SECONDS).readTimeout(15,java.util.concurrent.TimeUnit.SECONDS).callTimeout(30,java.util.concurrent.TimeUnit.SECONDS).build()
                     // 预取走的是另一个仓库实例：登录态与**设备身份 / 注册 Cookie**都要带过去，
                     // 少了后者它签名时只剩内置那份档案（`device_id` 被平台拉黑），取播放地址一律空响应。
                     val source=ContentRepository(http); source.credentials=credentials; source.inheritDevice(repository)
                     var made: RemoteVideo?=null
-                    val created=try {
+                    try {
                         if(!library.deviceRegistered()) { registerDeviceOnce(); source.inheritDevice(repository) }
-                        scope.run { RemoteVideo(http,source.stream(id,quality),newEpisodeCacheFile()).also { made=it; it.warm() } }
+                        // 取地址的接口约一半概率回空响应：当场隔 1.5 秒重试，最多 4 次。
+                        var info: StreamInfo?=null; var lastError: Exception?=null
+                        for(attempt in 1..4) {
+                            try { info=scope.run { source.stream(id,quality) }; break }
+                            catch(problem: InterruptedException) { throw problem }
+                            catch(problem: Exception) { lastError=problem; if(attempt<4) Thread.sleep(1_500) }
+                        }
+                        val stream=info ?: throw (lastError ?: java.io.IOException("取不到播放地址"))
+                        scope.run { RemoteVideo(http,stream,newEpisodeCacheFile()).also { video ->
+                            made=video
+                            video.refresh={ source.stream(id,quality) }
+                            video.log={ line -> log("$line key=$key") }
+                            video.warm()
+                        } }.also { created ->
+                            if(!preloaded.put(ticket,key,PrefetchedEpisode(created,http) { closeTransport(it) })) throw java.io.IOException("预载已作废")
+                            log("Preload prepared $key")
+                        }
                     } catch(problem: Exception) { made?.close(); closeTransport(http); throw problem }
-                    if(!preloaded.put(ticket,key,PrefetchedEpisode(created,http) { closeTransport(it) })) break
-                    remote=created
-                    android.util.Log.i("HGTV","Preload prepared $key")
                 }
-                if(remote.cacheable && !scope.run { remote.download(keepGoing=keepGoing) }) break
-                android.util.Log.i("HGTV","Preload complete $key")
+                if(!remote.cacheable) continue
+                if(scope.run { remote.download(keepGoing=keepGoing) }) log("Preload complete $key")
+            } catch(problem: InterruptedException) { break }
+            catch(problem: Exception) {
+                if(Thread.currentThread().isInterrupted) break
+                log("Preload failed $key: ${problem.javaClass.simpleName} ${problem.message}")
             }
-        } catch(_: Exception) {}
+        }
     }
 }
 internal fun MainActivity.networkAvailable(): Boolean = connectivity.getNetworkCapabilities(connectivity.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)==true
