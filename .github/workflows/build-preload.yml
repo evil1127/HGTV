@@ -32,9 +32,9 @@ jobs:
       - name: 安装 SDK 组件
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
       - name: 单元测试 + 打包
-        run: ./android/gradlew -p android :core:test :app:assembleDebug --console=plain
+        run: ./android/gradlew -p android :core:test :app:assembleRelease --console=plain
       - uses: actions/upload-artifact@v4
         with:
           name: HGTV-preload-apk
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
