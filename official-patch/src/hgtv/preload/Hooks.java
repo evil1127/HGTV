@@ -87,8 +87,8 @@ public final class Hooks {
             repository = repo;
             Entry e = BY_KEY.get(key(id, quality));
             lastId = id; lastQuality = quality;
-            if (e != null && e.usable()) {
-                log("Preload hit " + key(id, quality) + " complete=" + e.complete());
+            if (e != null && e.usable() && e.complete()) {
+                log("Preload hit " + key(id, quality));
                 STREAM_CALL.remove();
                 schedule(id, quality);
                 return e.stream;
@@ -121,12 +121,16 @@ public final class Hooks {
                 learnVideo(video);
                 // 第一次认出播放器的读取方式之前排的任务下不了：认出之后把这一轮重排一次。
                 if (lastId != null) schedule(lastId, lastQuality);
+            } else if (videoHttpField != null) {
+                Object http = videoHttpField.get(video);
+                if (http != null) httpClient = http;
             }
             String url = urlOfVideo(video);
             Entry e = url == null ? null : BY_URL.get(url);
             if (e == null || rangeConstructor == null) return null;
             byte[] bytes = e.read(start, end);
             if (bytes == null) return null;
+            if (start == 0) log("Preload served from disk " + e.key);
             return rangeConstructor.newInstance(bytes, e.total);
         } catch (Throwable t) { fail("rangeBefore", t); }
         return null;
@@ -231,20 +235,23 @@ public final class Hooks {
     private static boolean download(Entry e, long ticket) {
         if (e.file == null || e.complete()) return e.complete();
         if (videoConstructor == null || httpClient == null || rangeMethod == null) return false;
-        Object video = null;
-        try {
-            video = videoConstructor.newInstance(httpClient, e.stream);
-            while (!e.complete() && WINDOW.get() == ticket && !e.closed) {
-                long start = e.filled;
-                long end = e.total > 0 ? Math.min(e.total, start + CHUNK) - 1 : start + 256 * 1024 - 1;
-                Object range = rangeMethod.invoke(video, start, end);
-                learnRange(range);
-                if (!e.offer(start, (byte[]) rangeBytesField.get(range), rangeTotalField.getLong(range))) break;
+        for (int attempt = 1; attempt <= 2 && !e.complete() && WINDOW.get() == ticket && !e.closed; attempt++) {
+            Object video = null;
+            try {
+                video = videoConstructor.newInstance(httpClient, e.stream);
+                while (!e.complete() && WINDOW.get() == ticket && !e.closed) {
+                    long start = e.filled;
+                    long end = e.total > 0 ? Math.min(e.total, start + CHUNK) - 1 : start + 256 * 1024 - 1;
+                    Object range = rangeMethod.invoke(video, start, end);
+                    learnRange(range);
+                    if (!e.offer(start, (byte[]) rangeBytesField.get(range), rangeTotalField.getLong(range))) break;
+                }
+            } catch (Throwable t) {
+                log("Preload download error " + e.key + " attempt " + attempt + " at " + e.filled + "/" + e.total + ": " + rootMessage(t));
+                try { Thread.sleep(1500); } catch (InterruptedException ie) { return e.complete(); }
+            } finally {
+                if (video instanceof Closeable) try { ((Closeable) video).close(); } catch (Throwable ignored) {}
             }
-        } catch (Throwable t) {
-            log("Preload download error " + e.url.hashCode() + ": " + rootMessage(t));
-        } finally {
-            if (video instanceof Closeable) try { ((Closeable) video).close(); } catch (Throwable ignored) {}
         }
         return e.complete();
     }
