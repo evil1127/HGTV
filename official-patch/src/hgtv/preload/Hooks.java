@@ -40,6 +40,10 @@ public final class Hooks {
     private static final int CHUNK = 1024 * 1024;
     private static final long INCOMPLETE_TTL = 4 * 60_000L;
     private static final long MIN_FREE = 300L * 1024 * 1024;
+    /** 没下完的那一集只在取到地址后这段时间内交出去（地址还新鲜）；更久的就让官方重取。 */
+    private static final long FRESH_TTL = 120_000L;
+    /** 打开剧集页时，可能会点的几集先取好地址、下好开头这么多字节。 */
+    private static final int HEAD_BYTES = 2 * 1024 * 1024;
 
     private static volatile boolean enabled = true;
     private static final ThreadLocal<Boolean> INTERNAL = new ThreadLocal<>();
@@ -75,6 +79,8 @@ public final class Hooks {
     private static volatile boolean cleaned;
     private static volatile String lastId;
     private static volatile int lastQuality;
+    private static volatile long lastPlayAt;
+    private static volatile long lastRangeAt;
 
     private Hooks() {}
 
@@ -83,12 +89,13 @@ public final class Hooks {
     public static Object streamBefore(Object repo, String id, int quality) {
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
-            STREAM_CALL.set(new Object[]{repo, id, quality});
+            STREAM_CALL.set(new Object[]{repo, id, quality, System.currentTimeMillis()});
             repository = repo;
             Entry e = BY_KEY.get(key(id, quality));
             lastId = id; lastQuality = quality;
-            if (e != null && e.usable() && e.complete()) {
-                log("Preload hit " + key(id, quality));
+            rememberWatched(id);
+            if (e != null && e.servable()) {
+                log("Preload hit " + key(id, quality) + (e.complete() ? "" : " partial=" + e.filled + "/" + e.total));
                 STREAM_CALL.remove();
                 schedule(id, quality);
                 return e.stream;
@@ -105,6 +112,7 @@ public final class Hooks {
             if (call == null) return;
             String id = (String) call[1];
             int quality = (Integer) call[2];
+            log("Stream fetched " + key(id, quality) + " in " + (System.currentTimeMillis() - (Long) call[3]) + "ms");
             learnStream(call[0], result);
             entryFor(key(id, quality), result);
             schedule(id, quality);
@@ -117,6 +125,7 @@ public final class Hooks {
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
             RANGE_CALL.set(new Object[]{video, start});
+            lastRangeAt = System.currentTimeMillis();
             if (videoClass == null) {
                 learnVideo(video);
                 // 第一次认出播放器的读取方式之前排的任务下不了：认出之后把这一轮重排一次。
@@ -151,6 +160,30 @@ public final class Hooks {
 
     // ───────────────────────────── 入口：详情（集数列表） ─────────────────────────────
 
+    /** 取详情方法的入口：记下内容仓库（还没播过任何一集时，预热也要用它取地址）。 */
+    public static void repoSeen(Object repo) {
+        if (!enabled || repo == null || Boolean.TRUE.equals(INTERNAL.get())) return;
+        try {
+            if (repository == null) repository = repo;
+            if (streamMethod == null) {
+                Method found = null; int count = 0;
+                for (Method m : allMethods(repo.getClass())) {
+                    Class<?>[] p = m.getParameterTypes();
+                    if (p.length != 2 || p[0] != String.class || p[1] != int.class || Modifier.isStatic(m.getModifiers())) continue;
+                    if (looksLikeStream(m.getReturnType())) { found = m; count++; }
+                }
+                if (count == 1) { found.setAccessible(true); streamMethod = found; streamClass = found.getReturnType(); }
+            }
+        } catch (Throwable t) { fail("repoSeen", t); }
+    }
+
+    private static boolean looksLikeStream(Class<?> c) {
+        if (c.isPrimitive() || c.getName().startsWith("java.")) return false;
+        int strings = 0, bytes = 0;
+        for (Field f : allFields(c)) { if (f.getType() == String.class) strings++; if (f.getType() == byte[].class) bytes++; }
+        return strings >= 1 && bytes == 1;
+    }
+
     public static void detailAfter(Object detail) {
         if (!enabled || detail == null) return;
         try {
@@ -170,6 +203,7 @@ public final class Hooks {
                     SERIES.add(0, copy);
                     while (SERIES.size() > 6) SERIES.remove(SERIES.size() - 1);
                 }
+                warm(copy);
                 return;
             }
         } catch (Throwable t) { fail("detailAfter", t); }
@@ -177,7 +211,65 @@ public final class Hooks {
 
     // ───────────────────────────── 后台预载 ─────────────────────────────
 
+    /**
+     * 打开剧集页时的预热：第 1 集、上次看到的那一集和它的下一集，先取好地址、下好开头。
+     * 点下去时「正在获取播放地址」那段等待就省掉了。正在播放时不做（详情也可能是播放器里取的）。
+     */
+    private static void warm(List<String> episodes) {
+        if (Boolean.TRUE.equals(INTERNAL.get()) || repository == null || streamMethod == null) return;
+        long now = System.currentTimeMillis();
+        // 播放中（或刚播完几分钟内）取到的详情多半是播放器自己要的，不打扰正在进行的预载。
+        if (now - lastPlayAt < 180_000 || now - lastRangeAt < 60_000) return;
+        final int quality = lastQuality > 0 ? lastQuality : 1080;
+        final List<String> picks = new ArrayList<>();
+        String watched = lastWatched(episodes);
+        if (watched != null) {
+            picks.add(watched);
+            int i = episodes.indexOf(watched);
+            if (i >= 0 && i + 1 < episodes.size()) picks.add(episodes.get(i + 1));
+        }
+        if (!picks.contains(episodes.get(0))) picks.add(episodes.get(0));
+        final long ticket = WINDOW.incrementAndGet();
+        Set<String> keep = new LinkedHashSet<>();
+        for (String id : picks) keep.add(key(id, quality));
+        // 同一部剧已经预载好的那几集也留着（刚看完退回剧集页时，后面几集不用重下）。
+        for (String k : BY_KEY.keySet()) if (episodes.contains(k.substring(0, k.indexOf(':')))) keep.add(k);
+        prune(keep);
+        WORKER.execute(() -> {
+            INTERNAL.set(Boolean.TRUE);
+            try {
+                cleanOnce();
+                for (String id : picks) {
+                    if (WINDOW.get() != ticket) return;
+                    String k = key(id, quality);
+                    Entry e = BY_KEY.get(k);
+                    if (e == null || !e.servable()) {
+                        long t0 = System.currentTimeMillis();
+                        Object stream = fetchStream(id, quality);
+                        if (stream == null) { log("Warm failed " + k); continue; }
+                        e = entryFor(k, stream);
+                        if (e == null) continue;
+                        log("Warm prepared " + k + " in " + (System.currentTimeMillis() - t0) + "ms");
+                    }
+                    download(e, ticket, HEAD_BYTES);
+                }
+            } catch (Throwable t) {
+                log("Warm stopped: " + t);
+            } finally {
+                INTERNAL.remove();
+            }
+        });
+    }
+
+    private static void prune(Set<String> keep) {
+        for (Iterator<Map.Entry<String, Entry>> it = BY_KEY.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, Entry> item = it.next();
+            if (!keep.contains(item.getKey())) { it.remove(); BY_URL.remove(item.getValue().url); item.getValue().close(); }
+        }
+    }
+
     private static void schedule(String currentId, int quality) {
+        lastPlayAt = System.currentTimeMillis();
         final List<String> window = new ArrayList<>();
         synchronized (SERIES) {
             for (List<String> list : SERIES) {
@@ -193,16 +285,13 @@ public final class Hooks {
         Set<String> keep = new LinkedHashSet<>();
         keep.add(currentKey);
         for (String id : window) keep.add(key(id, quality));
-        for (Iterator<Map.Entry<String, Entry>> it = BY_KEY.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, Entry> item = it.next();
-            if (!keep.contains(item.getKey())) { it.remove(); BY_URL.remove(item.getValue().url); item.getValue().close(); }
-        }
+        prune(keep);
         WORKER.execute(() -> {
             INTERNAL.set(Boolean.TRUE);
             try {
                 cleanOnce();
                 Entry current = BY_KEY.get(currentKey);
-                if (current != null && download(current, ticket)) log("Preload current complete " + currentKey);
+                if (current != null && download(current, ticket, Long.MAX_VALUE)) log("Preload current complete " + currentKey);
                 for (String id : window) {
                     if (WINDOW.get() != ticket) return;
                     String k = key(id, quality);
@@ -214,7 +303,7 @@ public final class Hooks {
                         if (e == null) continue;
                         log("Preload prepared " + k);
                     }
-                    if (download(e, ticket)) log("Preload complete " + k);
+                    if (download(e, ticket, Long.MAX_VALUE)) log("Preload complete " + k);
                 }
             } catch (Throwable t) {
                 log("Preload stopped: " + t);
@@ -232,14 +321,14 @@ public final class Hooks {
     }
 
     /** 用官方自己的分段读取把整集原始字节下载到磁盘。返回是否已完整。 */
-    private static boolean download(Entry e, long ticket) {
+    private static boolean download(Entry e, long ticket, long limit) {
         if (e.file == null || e.complete()) return e.complete();
         if (videoConstructor == null || httpClient == null || rangeMethod == null) return false;
-        for (int attempt = 1; attempt <= 2 && !e.complete() && WINDOW.get() == ticket && !e.closed; attempt++) {
+        for (int attempt = 1; attempt <= 2 && !e.complete() && WINDOW.get() == ticket && !e.closed && e.filled < limit; attempt++) {
             Object video = null;
             try {
                 video = videoConstructor.newInstance(httpClient, e.stream);
-                while (!e.complete() && WINDOW.get() == ticket && !e.closed) {
+                while (!e.complete() && WINDOW.get() == ticket && !e.closed && e.filled < limit) {
                     long start = e.filled;
                     long end = e.total > 0 ? Math.min(e.total, start + CHUNK) - 1 : start + 256 * 1024 - 1;
                     Object range = rangeMethod.invoke(video, start, end);
@@ -375,6 +464,8 @@ public final class Hooks {
 
         boolean complete() { return total > 0 && filled >= total; }
         boolean usable() { return !closed && (complete() || System.currentTimeMillis() - createdAt < INCOMPLETE_TTL); }
+        /** 可以直接交给播放器：整集已在磁盘上，或地址取到还不久（没过期）。 */
+        boolean servable() { return !closed && (complete() || System.currentTimeMillis() - createdAt < FRESH_TTL); }
 
         synchronized boolean offer(long start, byte[] bytes, long size) {
             if (closed || file == null || bytes == null || bytes.length == 0) return false;
@@ -404,6 +495,43 @@ public final class Hooks {
             try { if (access != null) access.close(); } catch (Throwable ignored) {}
             if (file != null) file.delete();
         }
+    }
+
+    // ───────────────────────────── 上次看到哪一集（按剧记，存在缓存目录） ─────────────────────────────
+
+    private static final java.util.Properties WATCHED = new java.util.Properties();
+    private static volatile boolean watchedLoaded;
+
+    private static File watchedFile() {
+        File dir = cacheDir();
+        return dir == null ? null : new File(dir.getParentFile(), "hgtv-preload-watched.properties");
+    }
+
+    private static synchronized void loadWatched() {
+        if (watchedLoaded) return;
+        watchedLoaded = true;
+        File f = watchedFile();
+        if (f == null || !f.exists()) return;
+        try (java.io.FileInputStream in = new java.io.FileInputStream(f)) { WATCHED.load(in); } catch (Throwable ignored) {}
+    }
+
+    private static synchronized void rememberWatched(String id) {
+        String series = null;
+        synchronized (SERIES) { for (List<String> list : SERIES) if (list.contains(id)) { series = list.get(0); break; } }
+        if (series == null) return;
+        loadWatched();
+        if (id.equals(WATCHED.getProperty(series))) return;
+        WATCHED.setProperty(series, id);
+        while (WATCHED.size() > 200) WATCHED.remove(WATCHED.keys().nextElement());
+        File f = watchedFile();
+        if (f == null) return;
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) { WATCHED.store(out, null); } catch (Throwable ignored) {}
+    }
+
+    private static synchronized String lastWatched(List<String> episodes) {
+        loadWatched();
+        String id = WATCHED.getProperty(episodes.get(0));
+        return id != null && episodes.contains(id) ? id : null;
     }
 
     // ───────────────────────────── 工具 ─────────────────────────────
