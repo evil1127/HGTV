@@ -36,7 +36,11 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class Hooks {
     private static final String TAG = "HGTV";
-    private static final int AHEAD = 3;
+    private static final int AHEAD = 2;
+    /** 播放器最近这么久内还在向网络要数据，就算它忙，预载先让路。 */
+    private static final long PLAYER_BUSY_MS = 4_000L;
+    /** 每下完一块歇一下，别把 CDN 打满。 */
+    private static final long CHUNK_PAUSE_MS = 300L;
     private static final int CHUNK = 1024 * 1024;
     private static final long INCOMPLETE_TTL = 4 * 60_000L;
     private static final long MIN_FREE = 300L * 1024 * 1024;
@@ -81,6 +85,10 @@ public final class Hooks {
     private static volatile int lastQuality;
     private static volatile long lastPlayAt;
     private static volatile long lastRangeAt;
+    /** 播放器最近一次真的走网络（磁盘没有）的时间。 */
+    private static volatile long lastNetAt;
+    /** CDN 限流（429）或连续出错时，到这个时间之前都不预载。 */
+    private static volatile long pausedUntil;
 
     private Hooks() {}
 
@@ -94,8 +102,8 @@ public final class Hooks {
             Entry e = BY_KEY.get(key(id, quality));
             lastId = id; lastQuality = quality;
             rememberWatched(id);
-            if (e != null && e.servable()) {
-                log("Preload hit " + key(id, quality) + (e.complete() ? "" : " partial=" + e.filled + "/" + e.total));
+            if (e != null && !e.closed && e.complete()) {
+                log("Preload hit " + key(id, quality));
                 STREAM_CALL.remove();
                 schedule(id, quality);
                 return e.stream;
@@ -136,9 +144,8 @@ public final class Hooks {
             }
             String url = urlOfVideo(video);
             Entry e = url == null ? null : BY_URL.get(url);
-            if (e == null || rangeConstructor == null) return null;
-            byte[] bytes = e.read(start, end);
-            if (bytes == null) return null;
+            byte[] bytes = e == null || rangeConstructor == null ? null : e.read(start, end);
+            if (bytes == null) { lastNetAt = System.currentTimeMillis(); return null; }
             if (start == 0) log("Preload served from disk " + e.key);
             return rangeConstructor.newInstance(bytes, e.total);
         } catch (Throwable t) { fail("rangeBefore", t); }
@@ -203,7 +210,6 @@ public final class Hooks {
                     SERIES.add(0, copy);
                     while (SERIES.size() > 6) SERIES.remove(SERIES.size() - 1);
                 }
-                warm(copy);
                 return;
             }
         } catch (Throwable t) { fail("detailAfter", t); }
@@ -290,12 +296,13 @@ public final class Hooks {
             INTERNAL.set(Boolean.TRUE);
             try {
                 cleanOnce();
-                Entry current = BY_KEY.get(currentKey);
-                if (current != null && download(current, ticket, Long.MAX_VALUE)) log("Preload current complete " + currentKey);
+                // 正在播的这一集不另外下载：播放器自己读到的字节 rangeAfter 会顺手存下来，
+                // 再抓一遍等于对同一个文件发两倍请求，最容易被 CDN 限流（429）。
                 for (String id : window) {
                     if (WINDOW.get() != ticket) return;
                     String k = key(id, quality);
                     Entry e = BY_KEY.get(k);
+                    if (!waitForIdle(ticket)) return;
                     if (e == null || !e.usable()) {
                         Object stream = fetchStream(id, quality);
                         if (stream == null) { log("Preload failed " + k + ": no stream"); continue; }
@@ -304,6 +311,7 @@ public final class Hooks {
                         log("Preload prepared " + k);
                     }
                     if (download(e, ticket, Long.MAX_VALUE)) log("Preload complete " + k);
+                    else if (System.currentTimeMillis() < pausedUntil) return;
                 }
             } catch (Throwable t) {
                 log("Preload stopped: " + t);
@@ -311,6 +319,18 @@ public final class Hooks {
                 INTERNAL.remove();
             }
         });
+    }
+
+    /** 等到播放器不忙、也不在限流暂停期内。返回 false 表示这一轮已作废（换集了）。 */
+    private static boolean waitForIdle(long ticket) {
+        try {
+            while (WINDOW.get() == ticket) {
+                long now = System.currentTimeMillis();
+                if (now >= pausedUntil && now - lastNetAt >= PLAYER_BUSY_MS) return true;
+                Thread.sleep(1_000L);
+            }
+        } catch (InterruptedException ignored) {}
+        return false;
     }
 
     private static Object fetchStream(String id, int quality) {
@@ -329,15 +349,24 @@ public final class Hooks {
             try {
                 video = videoConstructor.newInstance(httpClient, e.stream);
                 while (!e.complete() && WINDOW.get() == ticket && !e.closed && e.filled < limit) {
+                    if (!waitForIdle(ticket)) return e.complete();
                     long start = e.filled;
                     long end = e.total > 0 ? Math.min(e.total, start + CHUNK) - 1 : start + 256 * 1024 - 1;
                     Object range = rangeMethod.invoke(video, start, end);
                     learnRange(range);
                     if (!e.offer(start, (byte[]) rangeBytesField.get(range), rangeTotalField.getLong(range))) break;
+                    Thread.sleep(CHUNK_PAUSE_MS);
                 }
+            } catch (InterruptedException ie) {
+                return e.complete();
             } catch (Throwable t) {
-                log("Preload download error " + e.key + " attempt " + attempt + " at " + e.filled + "/" + e.total + ": " + rootMessage(t));
-                try { Thread.sleep(1500); } catch (InterruptedException ie) { return e.complete(); }
+                String why = rootMessage(t);
+                boolean limited = why.contains("429");
+                // 被限流就整整停 2 分钟；其他错误停 30 秒，不连着重试（第二次也失败才放弃这一集）。
+                pausedUntil = System.currentTimeMillis() + (limited ? 120_000L : 30_000L);
+                log("Preload download error " + e.key + " attempt " + attempt + " at " + e.filled + "/" + e.total + ": " + why
+                        + " → pause " + (limited ? 120 : 30) + "s");
+                if (limited) return e.complete();
             } finally {
                 if (video instanceof Closeable) try { ((Closeable) video).close(); } catch (Throwable ignored) {}
             }
