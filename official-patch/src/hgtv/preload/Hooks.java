@@ -347,7 +347,7 @@ public final class Hooks {
         for (int attempt = 1; attempt <= 2 && !e.complete() && WINDOW.get() == ticket && !e.closed && e.filled < limit; attempt++) {
             Object video = null;
             try {
-                video = videoConstructor.newInstance(httpClient, e.stream);
+                video = newVideo(e);
                 while (!e.complete() && WINDOW.get() == ticket && !e.closed && e.filled < limit) {
                     if (!waitForIdle(ticket)) return e.complete();
                     long start = e.filled;
@@ -392,12 +392,21 @@ public final class Hooks {
     private static void learnVideo(Object video) throws Exception {
         if (videoClass != null) return;
         Class<?> c = video.getClass();
+        // 构造参数随版本会变（1.2.6：连接 + 地址；1.2.7 起又多一个「id:清晰度」字串），
+        // 只要求其中有一个 StreamInfo、一个连接对象，其余的字串 / 基本型别按类型补。
+        Class<?> httpType = null;
         for (Constructor<?> k : c.getDeclaredConstructors()) {
             Class<?>[] p = k.getParameterTypes();
-            if (p.length == 2 && streamClass != null && p[1] == streamClass) { k.setAccessible(true); videoConstructor = k; }
+            boolean hasStream = false; Class<?> other = null; boolean ok = true;
+            for (Class<?> t : p) {
+                if (streamClass != null && t == streamClass) hasStream = true;
+                else if (t == String.class || t.isPrimitive()) continue;
+                else if (other == null) other = t;
+                else ok = false;
+            }
+            if (hasStream && other != null && ok) { k.setAccessible(true); videoConstructor = k; httpType = other; }
         }
         if (videoConstructor == null) throw new IllegalStateException("video constructor not found");
-        Class<?> httpType = videoConstructor.getParameterTypes()[0];
         for (Field f : allFields(c)) {
             if (f.getType() == streamClass) { f.setAccessible(true); videoStreamField = f; }
             if (f.getType() == httpType) { f.setAccessible(true); videoHttpField = f; }
@@ -410,6 +419,22 @@ public final class Hooks {
                     && !m.getReturnType().isPrimitive()) { m.setAccessible(true); rangeMethod = m; }
         }
         videoClass = c;
+    }
+
+    private static Object newVideo(Entry e) throws Exception {
+        Class<?>[] p = videoConstructor.getParameterTypes();
+        Object[] args = new Object[p.length];
+        for (int i = 0; i < p.length; i++) {
+            Class<?> t = p[i];
+            if (t == streamClass) args[i] = e.stream;
+            else if (t == String.class) args[i] = e.key;
+            else if (t == boolean.class) args[i] = false;
+            else if (t == int.class) args[i] = 0;
+            else if (t == long.class) args[i] = 0L;
+            else if (t.isPrimitive()) throw new IllegalStateException("unsupported constructor param " + t);
+            else args[i] = httpClient;
+        }
+        return videoConstructor.newInstance(args);
     }
 
     private static void learnRange(Object range) throws Exception {
