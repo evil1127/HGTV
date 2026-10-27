@@ -2,10 +2,9 @@ name: Build preload APK
 
 # 预载版（预先下载当前集 + 后面 3 集）的打包流程：推送或手动触发都会打一个可安装的 APK，
 # 放在这次运行的 Artifacts 里下载。包名 com.hgtv.star.preload，和正式版并存，不会覆盖。
+# 旧源码版的预载（已改用 patch-official.yml，以官方新版为底）。只保留手动触发，免得每次上传文件都白跑一次。
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 permissions:
   contents: read

@@ -1,0 +1,135 @@
+name: Patch official APK (preload)
+
+# 把作者发布的官方 APK 加上「预载」后重新打包，发布到本仓库的 Releases（tag：preload-<官方版本>）。
+# - 每天自动检查一次作者有没有新版；有新版就自动打包，已打过的版本跳过。
+# - 也可以在 Actions 页面手动 Run workflow，可指定官方版本 tag（留空 = 最新）。
+# - 连接点找不到时 patch.py 会直接失败，不会产出改坏的 APK。
+on:
+  schedule:
+    - cron: '17 1 * * *'   # 每天台湾时间 09:17
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 官方版本 tag（例如 v1.2.6，留空 = 最新）
+        required: false
+      force:
+        description: 已经打过这个版本也重新打包
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: patch-official
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: pan8664716/HGTV
+      APKTOOL_URL: https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 决定要打包的官方版本
+        id: pick
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName); fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "preload-$tag" -R "${{ github.repository }}" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "preload-$tag 已存在，跳过。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          packages: platform-tools
+
+      - name: 安装 SDK 组件
+        if: steps.pick.outputs.skip != 'true'
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: 下载官方 APK 与 apktool
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p in
+          gh release download "${{ steps.pick.outputs.tag }}" -R "$UPSTREAM" --pattern '*.apk' --dir in
+          ls -la in
+          curl -sSfL -o apktool.jar "$APKTOOL_URL"
+
+      - name: 解包并插入连接点
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          java -jar apktool.jar d -b -f -o work in/*.apk
+          python3 official-patch/patch.py work
+
+      - name: 编译预载模块
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"; JAR="$ANDROID_HOME/platforms/android-36/android.jar"
+          mkdir -p hooks/classes hooks/dex
+          javac -source 8 -target 8 -nowarn -cp "$JAR" -d hooks/classes $(find official-patch/src -name '*.java')
+          "$BT/d8" --release --min-api 19 --lib "$JAR" --output hooks/dex $(find hooks/classes -name '*.class')
+          ls -la hooks/dex
+
+      - name: 重新打包并签名
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.HGTV_PRELOAD_KEYSTORE }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          java -jar apktool.jar b work -o unsigned.apk
+          # 预载模块放成下一个 classesN.dex
+          n=2; while unzip -l unsigned.apk | grep -q " classes$n.dex$"; do n=$((n+1)); done
+          cp hooks/dex/classes.dex "classes$n.dex"
+          zip -q -j unsigned.apk "classes$n.dex"
+          "$BT/zipalign" -p -f 4 unsigned.apk aligned.apk
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > sign.keystore
+          else
+            echo "::warning::没有设置 HGTV_PRELOAD_KEYSTORE，本次用临时签名（之后的版本无法直接覆盖安装）"
+            keytool -genkeypair -keystore sign.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10950 -dname "CN=HGTV Preload Temp"
+          fi
+          tag="${{ steps.pick.outputs.tag }}"
+          out="HGTV_preload_${tag#v}.apk"
+          "$BT/apksigner" sign --ks sign.keystore --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey --out "$out" aligned.apk
+          "$BT/apksigner" verify "$out"
+          rm -f sign.keystore
+          echo "OUT=$out" >> "$GITHUB_ENV"
+
+      - name: 发布到 Releases
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.pick.outputs.tag }}"
+          notes="以官方 ${tag}（${UPSTREAM}）为底，加上预载：当前集与后面 3 集整集预先下载。包名 com.hgtv.star.preload，可与官方版并存。"
+          if gh release view "preload-$tag" >/dev/null 2>&1; then
+            gh release upload "preload-$tag" "$OUT" --clobber
+          else
+            gh release create "preload-$tag" "$OUT" --title "预载版 ${tag}" --notes "$notes"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          name: HGTV-preload-${{ steps.pick.outputs.tag }}
+          path: HGTV_preload_*.apk
