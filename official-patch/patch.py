@@ -133,6 +133,18 @@ def main():
         die("找不到取详情的方法")
     print(f"stream={stream[0][0].name}->{stream[0][1]} range={ranges[0][0].name}->{ranges[0][1]} detail={[(d[0].name, d[1]) for d in details]}")
 
+    # 预载模块要自己 new 一个「读取影片」的对象来下载：它的构造参数里必须有 StreamInfo，
+    # 其余只能是一个连接对象加上字串 / 基本型别（见 Hooks.learnVideo），否则这个版本不支持。
+    video_text = files[ranges[0][0]]
+    ctors = re.findall(r"^\.method [^\n]*constructor <init>\(([^)]*)\)V", video_text, re.M)
+    def ctor_ok(desc):
+        parts = re.findall(r"\[*(?:L[^;]+;|[ZBCSIJFD])", desc)
+        objects = [x for x in parts if x.startswith("L") and x not in (stream_cls, "Ljava/lang/String;")]
+        return stream_cls in parts and len(objects) == 1
+    if not any(ctor_ok(c) for c in ctors):
+        die(f"读取影片的类没有可用的构造方法：{ctors}")
+    print(f"video constructors={ctors}")
+
     plans = []
     p, name, _, s, e = stream[0]
     plans.append((p, s, e,
