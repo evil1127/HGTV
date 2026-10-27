@@ -154,8 +154,9 @@ def main():
         ":{label}",
         "invoke-static/range {{{r} .. {r}}}, " + HOOKS + "->rangeAfter(Ljava/lang/Object;)V",
         "hgtv_preload_range_miss"))
-    for p, name, _, s, e in details:
-        plans.append((p, s, e, "", "invoke-static/range {{{r} .. {r}}}, " + HOOKS + "->detailAfter(Ljava/lang/Object;)V", ""))
+    for p, name, static, s, e in details:
+        before = "" if static else "invoke-static/range {{p0 .. p0}}, " + HOOKS + "->repoSeen(Ljava/lang/Object;)V"
+        plans.append((p, s, e, before, "invoke-static/range {{{r} .. {r}}}, " + HOOKS + "->detailAfter(Ljava/lang/Object;)V", ""))
 
     # 同一个文件里有多处要改时，从后往前改，前面的偏移才不会变。
     by_file = {}
