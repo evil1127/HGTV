@@ -771,7 +771,7 @@ public final class Hooks {
             ev("播放失败 stage=" + stage + " err=" + (error == null ? "-" : rootMessage(error))
                     + " 线路=" + (line == null ? "?" : (line.usingBackup ? "备用 " : "主 ") + line.current()));
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
-            if (line != null && !"-".equals(line.current())) clearHost(line.current(), stage);
+            if (line != null && line.current().contains(".")) clearHost(line.current(), stage);
             int dropped = dropCachedStreams();
             int files = 0;
             long t0 = System.currentTimeMillis();
@@ -854,17 +854,20 @@ public final class Hooks {
             String fid = o.optString("file_id", "");
             if (fid.isEmpty()) fid = o.optString("file_hash", "");
             String main = o.optString("main_url", "");
-            String backup = plainUrl(o.optString("backup_url_1", ""));
+            // 平台的 main_url / backup_url_1 是加密字串（作者用 key_seed 解），这里不解，直接把备用那串放进 main_url 让作者照常解。
+            String backupRaw = o.optString("backup_url_1", "");
+            String backup = plainUrl(backupRaw);
             long now = System.currentTimeMillis();
             Line l = LINES.get(fid);
             if (l == null || now - l.last > 180_000L) { l = new Line(); LINES.put(fid, l); }
             if (LINES.size() > 50) LINES.clear();
             l.fetches++; l.last = now;
-            l.mainHost = hostOf(plainUrl(main)); l.backupHost = hostOf(backup);
+            l.mainHost = main.isEmpty() ? "-" : (plainUrl(main).isEmpty() ? "(加密)" : hostOf(plainUrl(main)));
+            l.backupHost = backupRaw.isEmpty() ? "-" : (backup.isEmpty() ? "(加密)" : hostOf(backup));
             curFid = fid;
-            boolean wantBackup = l.fetches % 2 == 0 && backup.startsWith("http");
+            boolean wantBackup = l.fetches % 2 == 0 && !backupRaw.isEmpty() && !backupRaw.equals(main);
             if (wantBackup) {
-                o.put("main_url", backup);
+                o.put("main_url", backupRaw);
                 l.usingBackup = true;
                 LINE_SWITCHES.incrementAndGet();
                 ev("线路 第" + l.fetches + "次取地址 → 备用 " + l.backupHost + "（主 " + l.mainHost + "）");
