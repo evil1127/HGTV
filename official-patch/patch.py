@@ -271,6 +271,23 @@ def tune_warm(files):
             ok = True
     report(ok, "下一集提早暖机（剩 75 秒开始，失败每 4 秒重试、最多 7 次）" + ("" if ok else "：找不到作者的暖机条件"))
 
+def limit_prepare(files, reader_path):
+    """起播准备（读取器里含 "prepared" 的无参方法）限 10 秒：开头 / 每个 return-void 前挂上 Hooks.prepareBegin / prepareEnd。"""
+    text = files[reader_path]
+    hits = [m for m in METHOD_RE.finditer(text) if "static" not in m.group(1).split() and m.group(3) == "" and m.group(4) == "V" and '"prepared"' in m.group(5)]
+    ok = len(hits) == 1
+    if ok:
+        m = hits[0]
+        body = m.group(5)
+        body = re.sub(r"(\n(\s*)return-void)", lambda mm: "\n" + mm.group(2) + "invoke-static/range {p0 .. p0}, " + HOOKS + "->prepareEnd(Ljava/lang/Object;)V\n" + mm.group(1), body)
+        lines = body.split("\n")
+        idx = first_code_index(lines)
+        lines.insert(idx, "    invoke-static/range {p0 .. p0}, " + HOOKS + "->prepareBegin(Ljava/lang/Object;)V\n")
+        body = "\n".join(lines)
+        text = text[:m.start(5)] + body + text[m.end(5):]
+        reader_path.write_text(text, encoding="utf-8"); files[reader_path] = text
+    report(ok, "起播准备限 10 秒（只限开头这一步，一般下载仍 25 秒）" + ("" if ok else f"：找到 {len(hits)} 个起播准备方法"))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -351,6 +368,7 @@ def main():
     tune_buffer(files)
     add_fix_hooks(files)
     tune_warm(files)
+    limit_prepare(files, ranges[0][0])
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
