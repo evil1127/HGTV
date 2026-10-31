@@ -49,7 +49,14 @@ public final class Hooks {
     /** 打开剧集页时，可能会点的几集先取好地址、下好开头这么多字节。 */
     private static final int HEAD_BYTES = 2 * 1024 * 1024;
 
-    private static volatile boolean enabled = true;
+    /**
+     * 预载暂时关闭（2026-10-31，以 1.2.9.1 实测）：
+     *  - 1.2.9.1 的播放器不再走被挂钩的分段读取，预载以为播放器闲着，全速下载，和播放器抢同一个 CDN 连线；
+     *  - 预载下载的集数 ID 与播放器实际要的对不上，从没命中过（log 里没有任何 Preload hit / served from disk）；
+     *  - 官方 1.2.9.1 自己已会提前取下一集地址。
+     * 改回 true 前要先解决上面两点。
+     */
+    private static volatile boolean enabled = false;
     private static final ThreadLocal<Boolean> INTERNAL = new ThreadLocal<>();
     private static final ThreadLocal<Object[]> STREAM_CALL = new ThreadLocal<>();
     private static final ThreadLocal<Object[]> RANGE_CALL = new ThreadLocal<>();
