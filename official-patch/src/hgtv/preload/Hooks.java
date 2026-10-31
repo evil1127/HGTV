@@ -595,6 +595,48 @@ public final class Hooks {
         return id != null && episodes.contains(id) ? id : null;
     }
 
+    // ───────────────────────────── 诊断：平台有没有给备用线路 ─────────────────────────────
+
+    private static int probes;
+
+    /**
+     * 只记录、不改任何东西：取播放地址时，平台给的那一档影片里有哪些栏位、各条线路的主机名。
+     * 用来确认有没有 backup_url 可以在主线路连不上时改用。只记主机名，不记完整地址。
+     * 不受 {@link #enabled} 影响；每次启动最多记 6 次。
+     */
+    public static void probeVideo(Object video) {
+        try {
+            if (!(video instanceof org.json.JSONObject) || probes >= 6) return;
+            probes++;
+            org.json.JSONObject o = (org.json.JSONObject) video;
+            StringBuilder keys = new StringBuilder();
+            StringBuilder hosts = new StringBuilder();
+            for (Iterator<String> it = o.keys(); it.hasNext(); ) {
+                String k = it.next();
+                keys.append(k).append(',');
+                if (!k.toLowerCase().contains("url")) continue;
+                Object v = o.opt(k);
+                hosts.append(k).append('=').append(hostOf(v)).append(' ');
+            }
+            log("Video probe keys=[" + keys + "] " + hosts);
+        } catch (Throwable t) {
+            log("Video probe failed: " + rootMessage(t));
+        }
+    }
+
+    private static String hostOf(Object v) {
+        if (v == null) return "-";
+        String s = String.valueOf(v).trim();
+        if (s.isEmpty()) return "(空)";
+        if (!s.startsWith("http")) {
+            try {
+                s = new String(android.util.Base64.decode(s, android.util.Base64.DEFAULT), "UTF-8").trim();
+            } catch (Throwable ignored) { return "(非网址)"; }
+        }
+        try { String h = new java.net.URI(s.replace("\\/", "/")).getHost(); return h == null ? "(解析不了)" : h; }
+        catch (Throwable t) { return "(解析不了)"; }
+    }
+
     // ───────────────────────────── 工具 ─────────────────────────────
 
     private static String key(String id, int quality) { return id + ":" + quality; }
