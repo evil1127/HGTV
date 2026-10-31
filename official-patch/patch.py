@@ -205,7 +205,7 @@ def add_fix_hooks(files):
         if len(hits) == 1:
             insert_at_method_start(files, hits[0][0], hits[0][1], "invoke-static/range {p0 .. p0}, " + HOOKS + "->onAppStart(Ljava/lang/Object;)V")
             done = True
-    report(done, "启动清理（DNS 档 / 未完成暂存）+ 诊断页 :18321/diag" + ("" if done else "：找不到 Application.onCreate"))
+    report(done, "启动清理（DNS 档 / 播放暂存：地址、开头、索引）+ 诊断页 :18321/diag" + ("" if done else "：找不到 Application.onCreate"))
 
     # 2. 作者的 DNS：查询方法最前面认出快取；「改问大陆公共 DNS」那支记下来 60 秒后作废
     dns_files = [p for p, x in files.items() if "Broken system behaviour for dns lookup of" in x and '"dns public host="' in x]
@@ -241,6 +241,15 @@ def add_fix_hooks(files):
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; hits += n
     report(hits == 1, "主线路 / 备用线路（backup_url_1）轮替" + ("" if hits == 1 else f"：解析 main_url 的位置找到 {hits} 个"))
+
+    # 5. 认出内容仓库：所有 (String, int) -> StreamInfo 的非静态方法（取地址 / 读快取地址）最前面
+    stream_cls = find_class_by_string(files, "StreamInfo(url=")
+    caps = method_bodies(files, lambda p, x, m: "static" not in m.group(1).split() and m.group(3) == "Ljava/lang/String;I" and m.group(4) == stream_cls)
+    for path, m in sorted(caps, key=lambda c: -c[1].start()):
+        fresh = [mm for mm in METHOD_RE.finditer(files[path]) if mm.start() == m.start()]
+        if fresh:
+            insert_at_method_start(files, path, fresh[0], "invoke-static/range {p0 .. p0}, " + HOOKS + "->repoCapture(Ljava/lang/Object;)V")
+    report(len(caps) > 0, f"失败时清记忆体里快取的播放地址（{len(caps)} 个入口）" if caps else "失败时清快取地址：找不到取地址的方法")
 
 
 def tune_warm(files):
