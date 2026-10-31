@@ -655,10 +655,24 @@ public final class Hooks {
             }
             try { appVersion = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName; } catch (Throwable ignored) {}
             boolean dns = new File(cache, "dns-v1.txt").delete();
-            int tmp = deleteTmp(new File(cache, "playback-v1"));
-            ev("=== App 启动 " + appVersion + "：清 DNS 档=" + dns + "，清未完成暂存=" + tmp + " 个");
+            // 作者把「播放地址（url-）、影片开头（head-）、索引（idx-）」都存在 playback-v1，重开 App 也照用。
+            // 地址过期 / 节点坏掉 / 开头档坏掉时会一直卡在同一秒（#21：要清缓存才好）。启动时整个清掉。
+            int pb = deleteAll(new File(cache, "playback-v1"), "");
+            ev("=== App 启动 " + appVersion + "：清 DNS 档=" + dns + "，清播放暂存=" + pb + " 个");
             startDiag();
         } catch (Throwable t) { log("onAppStart failed: " + rootMessage(t)); }
+    }
+
+    /** 删掉 dir 底下档名以 prefix 开头的档案（prefix 空字串 = 全部），回传删掉几个。 */
+    private static int deleteAll(File dir, String prefix) {
+        int n = 0;
+        File[] list = dir == null ? null : dir.listFiles();
+        if (list == null) return 0;
+        for (File f : list) {
+            if (f.isDirectory()) n += deleteAll(f, prefix);
+            else if (f.getName().startsWith(prefix) && f.delete()) n++;
+        }
+        return n;
     }
 
     private static int deleteTmp(File dir) {
@@ -759,7 +773,15 @@ public final class Hooks {
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
             if (line != null && !"-".equals(line.current())) clearHost(line.current(), stage);
             int dropped = dropCachedStreams();
-            if (dropped > 0) ev("丢掉快取的播放地址 " + dropped + " 个（重载时重新取，可轮到备用线路）");
+            int files = 0;
+            long t0 = System.currentTimeMillis();
+            if (t0 - lastDiskDrop > 8_000L && appCacheDir != null) {
+                lastDiskDrop = t0;
+                File pb = new File(appCacheDir, "playback-v1");
+                files = deleteAll(pb, "url-") + deleteAll(pb, "head-") + deleteAll(pb, "idx-");
+            }
+            if (dropped + files > 0) ev("丢掉快取的播放地址 " + dropped + " 个、播放暂存档 " + files + " 个（重载时重新取，可轮到备用线路）");
+            else if (repository == null) ev("（还没认出内容仓库，记忆体里的播放地址没清到）");
             if (stage.contains("prepare")) {
                 long now = System.currentTimeMillis();
                 if (now - lastTmpClean > 60_000L) { lastTmpClean = now; int n = deleteTmp(appCacheDir == null ? null : new File(appCacheDir, "playback-v1")); if (n > 0) ev("清未完成暂存 " + n + " 个"); }
@@ -776,6 +798,12 @@ public final class Hooks {
     }
 
     private static volatile long lastDrop;
+    private static volatile long lastDiskDrop;
+
+    /** 插在作者「取播放地址 / 读快取地址」的方法最前面：记下内容仓库，失败时才清得到它快取的地址。 */
+    public static void repoCapture(Object repo) {
+        if (repo != null) repository = repo;
+    }
 
     /**
      * 作者把取到的播放地址快取在内容仓库里（失效前一直重用）。缓冲卡住时作者只清连线池、用同一个地址重载，
