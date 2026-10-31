@@ -120,9 +120,7 @@ def tune_stall_recovery(files):
         new, n = timeout_re.subn(lambda m: m.group(1) + "0x6" + m.group(3) + m.group(5) + "0x8" + m.group(7) + m.group(8) + "0x19" + m.group(10), text)
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
-    print(f"tuned {clients} 个影片连线的逾时")
-    if clients == 0:
-        print("::warning::没找到影片连线的逾时设定（读取 30 秒 / 总计 45 秒），这一版没缩短")
+    report(clients > 0, f"影片连线逾时缩短（{clients} 处）" if clients else "影片连线逾时缩短：没找到逾时设定")
 
     stall_msg = "\\u64ad\\u653e\\u4e2d\\u7f13\\u51b2\\u505c\\u6b62\\u524d\\u8fdb 30 \\u79d2"
     stall = 0
@@ -139,9 +137,7 @@ def tune_stall_recovery(files):
                 text = text[:m.start(5)] + nb + text[m.end(5):]
                 path.write_text(text, encoding="utf-8"); files[path] = text; stall += 1
             break
-    print(f"tuned {stall} 处缓冲卡住看门狗（30 秒 → 10 秒）")
-    if stall == 0:
-        print("::warning::没找到「缓冲停止前进 30 秒」看门狗，这一版没缩短")
+    report(stall > 0, "缓冲卡住 10 秒就重连" if stall else "缓冲卡住看门狗：没找到")
 
 
 def tune_buffer(files):
@@ -164,24 +160,107 @@ def tune_buffer(files):
             if a and b and c:
                 text = text[:m.start(5)] + nb + text[m.end(5):]
                 path.write_text(text, encoding="utf-8"); files[path] = text; done += 1
-                print(f"tuned buffer in {path.name}（续播 {a} / min {b} / max {c} / 容量 {d}）")
+                report(True, "播放缓冲加大（整集 / 卡住后先存 6 秒 / 64 MB）")
             break
     if done == 0:
-        print("::warning::没找到播放缓冲设定（bufferForPlaybackAfterRebufferMs），这一版缓冲没加大")
+        report(False, "播放缓冲加大：没找到缓冲设定")
 
-def add_video_probe(files):
-    """诊断：在解析 main_url 的地方记一行「这档影片有哪些栏位 / 各线路主机名」，确认有没有备用线路。只记录，不改行为。"""
-    probe_re = re.compile(r'(\n(\s*)const-string (v\d+), "main_url"\s+invoke-static \{(v\d+), \3\}, L[^;]+;->\w+\(Lorg/json/JSONObject;Ljava/lang/String;\)Ljava/lang/String;)')
+REPORT = []
+
+
+def report(ok, text):
+    """记一项修补结果；最后写进 patch-report.md，发布说明会附上（哪项没套上一眼就看得到）。"""
+    REPORT.append(("✅ " if ok else "⚠️ ") + text)
+    if not ok:
+        print(f"::warning::{text}")
+
+
+def method_bodies(files, pred):
+    """回传 [(path, match)]：pred(path, text, match) 为真的所有方法。"""
+    out = []
+    for path, text in files.items():
+        for m in METHOD_RE.finditer(text):
+            if pred(path, text, m):
+                out.append((path, m))
+    return out
+
+
+def insert_at_method_start(files, path, m, code):
+    text = files[path]
+    body = m.group(5)
+    lines = body.split("\n")
+    idx = first_code_index(lines)
+    lines.insert(idx, "    " + code + "\n")
+    nb = "\n".join(lines)
+    text = text[:m.start(5)] + nb + text[m.end(5):]
+    path.write_text(text, encoding="utf-8"); files[path] = text
+
+
+def add_fix_hooks(files):
+    # 1. Application.onCreate 最前面：启动清理 + 诊断页
+    apps = [p for p, x in files.items() if re.search(r"^\.super Landroid/app/Application;", x, re.M)]
+    done = False
+    if len(apps) == 1:
+        hits = method_bodies({apps[0]: files[apps[0]]}, lambda p, x, m: m.group(2) == "onCreate" and m.group(3) == "" and m.group(4) == "V")
+        if len(hits) == 1:
+            insert_at_method_start(files, hits[0][0], hits[0][1], "invoke-static/range {p0 .. p0}, " + HOOKS + "->onAppStart(Ljava/lang/Object;)V")
+            done = True
+    report(done, "启动清理（DNS 档 / 未完成暂存）+ 诊断页 :18321/diag" + ("" if done else "：找不到 Application.onCreate"))
+
+    # 2. 作者的 DNS：查询方法最前面认出快取；「改问大陆公共 DNS」那支记下来 60 秒后作废
+    dns_files = [p for p, x in files.items() if "Broken system behaviour for dns lookup of" in x and '"dns public host="' in x]
+    ok_seen = ok_pub = False
+    if len(dns_files) == 1:
+        path = dns_files[0]
+        hits = method_bodies({path: files[path]}, lambda p, x, m: "static" not in m.group(1).split() and m.group(3) == "Ljava/lang/String;" and m.group(4) == "Ljava/util/List;" and "dns public host=" in m.group(5))
+        if len(hits) == 1:
+            insert_at_method_start(files, path, hits[0][1], "invoke-static/range {p0 .. p0}, " + HOOKS + "->dnsSeen(Ljava/lang/Object;)V")
+            ok_seen = True
+            text = files[path]
+            pub = re.compile(r'(const-string (v\d+), "dns public host="\s+invoke-direct \{(v\d+), \2\}, Ljava/lang/StringBuilder;-><init>\(Ljava/lang/String;\)V\s+invoke-virtual \{\3, (v\d+)\}, Ljava/lang/StringBuilder;->append\(Ljava/lang/String;\)Ljava/lang/StringBuilder;)')
+            new, n = pub.subn(lambda mm: mm.group(1) + "\n\n    invoke-static/range {" + mm.group(4) + " .. " + mm.group(4) + "}, " + HOOKS + "->dnsPublic(Ljava/lang/String;)V", text)
+            if n == 1:
+                path.write_text(new, encoding="utf-8"); files[path] = new; ok_pub = True
+    report(ok_seen, "失败时清 DNS（认出作者的 DNS 快取）" + ("" if ok_seen else "：找不到作者的 DNS 查询方法"))
+    report(ok_pub, "大陆公共 DNS 的结果 60 秒后作废" + ("" if ok_pub else "：找不到「dns public host=」那一支"))
+
+    # 3. 播放失败上报：static (MainActivity, Throwable, String)V
+    hits = method_bodies(files, lambda p, x, m: "static" in m.group(1).split() and re.fullmatch(r"L[^;]*MainActivity;Ljava/lang/Throwable;Ljava/lang/String;", m.group(3) or "") and m.group(4) == "V")
+    ok = len(hits) == 1
+    if ok:
+        insert_at_method_start(files, hits[0][0], hits[0][1], "invoke-static/range {p1 .. p2}, " + HOOKS + "->onFailure(Ljava/lang/Throwable;Ljava/lang/String;)V")
+    report(ok, "播放失败时清这一集的伺服器 DNS / 未完成暂存；连续失败清全部" + ("" if ok else f"：失败上报方法找到 {len(hits)} 个"))
+
+    # 4. 主 / 备线路轮替：解析 main_url 之前
+    pick_re = re.compile(r'(\n(\s*)const-string (v\d+), "main_url"\s+invoke-static \{(v\d+), \3\}, L[^;]+;->\w+\(Lorg/json/JSONObject;Ljava/lang/String;\)Ljava/lang/String;)')
     hits = 0
     for path, text in list(files.items()):
         if "/novel/player/video_model/v1/" not in text:
             continue
-        new, n = probe_re.subn(lambda m: "\n" + m.group(2) + "invoke-static/range {" + m.group(4) + " .. " + m.group(4) + "}, " + HOOKS + "->probeVideo(Ljava/lang/Object;)V\n" + m.group(1), text)
+        new, n = pick_re.subn(lambda m: "\n" + m.group(2) + "invoke-static/range {" + m.group(4) + " .. " + m.group(4) + "}, " + HOOKS + "->pickLine(Ljava/lang/Object;)V\n" + m.group(1), text)
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; hits += n
-    print(f"probe {hits} 处（备用线路诊断）")
-    if hits == 0:
-        print("::warning::没找到解析 main_url 的位置，这一版没有备用线路诊断")
+    report(hits == 1, "主线路 / 备用线路（backup_url_1）轮替" + ("" if hits == 1 else f"：解析 main_url 的位置找到 {hits} 个"))
+
+
+def tune_warm(files):
+    """下一集暖机：作者在剩 30 秒时才开始，失败每 10 秒重试、最多 5 次。
+    改成剩 75 秒（一集约 90 秒，等于开播不久就准备），失败每 4 秒重试、最多 7 次（每次重取地址会轮替主 / 备线路）。"""
+    marker = "0x46ea6000    # 30000.0f"
+    hits = method_bodies(files, lambda p, x, m: marker in m.group(5) and "isActiveNetworkMetered" in m.group(5))
+    ok = False
+    if len(hits) == 1:
+        path, m = hits[0]
+        body = m.group(5)
+        nb, a = re.subn(r"const (v\d+), 0x46ea6000    # 30000\.0f", r"const \1, 0x47927c00    # 75000.0f", body)
+        nb, b = re.subn(r"const-wide/16 (v\d+), 0x2710\n", r"const-wide/16 \1, 0xfa0\n", nb)
+        nb, c = re.subn(r"const/4 (v\d+), 0x5(\s+if-ge v\d+, \1,)", r"const/4 \1, 0x7\2", nb)
+        if a == 1 and b == 1 and c == 1:
+            text = files[path]
+            text = text[:m.start(5)] + nb + text[m.end(5):]
+            path.write_text(text, encoding="utf-8"); files[path] = text
+            ok = True
+    report(ok, "下一集提早暖机（剩 75 秒开始，失败每 4 秒重试、最多 7 次）" + ("" if ok else "：找不到作者的暖机条件"))
 
 
 def main():
@@ -261,7 +340,8 @@ def main():
 
     tune_stall_recovery(files)
     tune_buffer(files)
-    add_video_probe(files)
+    add_fix_hooks(files)
+    tune_warm(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
@@ -293,6 +373,8 @@ def main():
     if 'android:authorities="' in mtext:
         mtext = re.sub(r'android:authorities="([^"]+)"', lambda m: f'android:authorities="{m.group(1)}.preload"', mtext)
     manifest.write_text(mtext, encoding="utf-8")
+    pathlib.Path("patch-report.md").write_text("\n".join("- " + r for r in REPORT) + "\n", encoding="utf-8")
+    print("\n".join(REPORT))
     print("done")
 
 
