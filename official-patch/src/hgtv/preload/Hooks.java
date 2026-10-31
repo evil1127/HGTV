@@ -595,46 +595,301 @@ public final class Hooks {
         return id != null && episodes.contains(id) ? id : null;
     }
 
-    // ───────────────────────────── 诊断：平台有没有给备用线路 ─────────────────────────────
+    // ═════════════════════════════ 修补版功能（2026-11）═════════════════════════════
+    //  1. 启动清理：删 dns-v1.txt（作者存的 DNS）与 playback-v1 里没下完的 .tmp。
+    //  2. 失败时清 DNS：播放失败（连不上 / 本地准备超时 / 缓冲停住）就清这一集用到的伺服器；
+    //     同一集 3 分钟内失败 2 次就全部清。同一台 30 秒内最多清一次。
+    //  3. 大陆公共 DNS 查到的结果只用 60 秒，不留到下次。
+    //  4. 主线路 / 备用线路轮替：同一集重取地址时 main_url 与 backup_url_1 轮流用。
+    //  5. 诊断页：电视上开一个只读网页 http://<电视IP>:18321/diag，内容是修补事件 + 本 App 的 log。
 
-    private static int probes;
+    private static final int DIAG_PORT = 18321;
+    private static final int EVENT_MAX = 300;
+    private static final java.util.ArrayDeque<String> EVENTS = new java.util.ArrayDeque<>();
+    private static volatile File diagFile;
+    private static volatile File appCacheDir;
+    private static volatile String appVersion = "?";
+    private static final long STARTED = System.currentTimeMillis();
+    private static final java.util.concurrent.atomic.AtomicInteger DNS_CLEARS = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger LINE_SWITCHES = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger FAILURES = new java.util.concurrent.atomic.AtomicInteger();
 
-    /**
-     * 只记录、不改任何东西：取播放地址时，平台给的那一档影片里有哪些栏位、各条线路的主机名。
-     * 用来确认有没有 backup_url 可以在主线路连不上时改用。只记主机名，不记完整地址。
-     * 不受 {@link #enabled} 影响；每次启动最多记 6 次。
-     */
-    public static void probeVideo(Object video) {
-        try {
-            if (!(video instanceof org.json.JSONObject) || probes >= 6) return;
-            probes++;
-            org.json.JSONObject o = (org.json.JSONObject) video;
-            StringBuilder keys = new StringBuilder();
-            StringBuilder hosts = new StringBuilder();
-            for (Iterator<String> it = o.keys(); it.hasNext(); ) {
-                String k = it.next();
-                keys.append(k).append(',');
-                if (!k.toLowerCase().contains("url")) continue;
-                Object v = o.opt(k);
-                hosts.append(k).append('=').append(hostOf(v)).append(' ');
+    /** 记一条修补事件：内存保留最近 300 条，同时写进 files/hgtv-fix-diag.txt（重开 App 也看得到）。 */
+    static void ev(String what) {
+        String line = new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.ROOT).format(new java.util.Date()) + " " + what;
+        synchronized (EVENTS) {
+            EVENTS.addLast(line);
+            while (EVENTS.size() > EVENT_MAX) EVENTS.removeFirst();
+            File f = diagFile;
+            if (f != null) {
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(f, true)) { out.write((line + "\n").getBytes("UTF-8")); } catch (Throwable ignored) {}
             }
-            log("Video probe keys=[" + keys + "] " + hosts);
-        } catch (Throwable t) {
-            log("Video probe failed: " + rootMessage(t));
         }
+        log("[fix] " + what);
     }
 
-    private static String hostOf(Object v) {
-        if (v == null) return "-";
-        String s = String.valueOf(v).trim();
-        if (s.isEmpty()) return "(空)";
-        if (!s.startsWith("http")) {
-            try {
-                s = new String(android.util.Base64.decode(s, android.util.Base64.DEFAULT), "UTF-8").trim();
-            } catch (Throwable ignored) { return "(非网址)"; }
+    // ───────────── 1. 启动 ─────────────
+
+    /** 插在 Application.onCreate 最前面（作者读 DNS / 播放缓存之前）。 */
+    public static void onAppStart(Object app) {
+        try {
+            android.content.Context ctx = (android.content.Context) app;
+            File cache = ctx.getCacheDir();
+            appCacheDir = cache;
+            File files = ctx.getFilesDir();
+            File df = new File(files, "hgtv-fix-diag.txt");
+            synchronized (EVENTS) {
+                // 只留上次最后 300 行，避免档案越长越大
+                List<String> old = new ArrayList<>();
+                if (df.exists()) {
+                    try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(df), "UTF-8"))) {
+                        for (String l; (l = r.readLine()) != null; ) old.add(l);
+                    } catch (Throwable ignored) {}
+                }
+                int from = Math.max(0, old.size() - EVENT_MAX);
+                StringBuilder keep = new StringBuilder();
+                for (int i = from; i < old.size(); i++) { EVENTS.addLast(old.get(i)); keep.append(old.get(i)).append('\n'); }
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(df, false)) { out.write(keep.toString().getBytes("UTF-8")); } catch (Throwable ignored) {}
+                diagFile = df;
+            }
+            try { appVersion = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName; } catch (Throwable ignored) {}
+            boolean dns = new File(cache, "dns-v1.txt").delete();
+            int tmp = deleteTmp(new File(cache, "playback-v1"));
+            ev("=== App 启动 " + appVersion + "：清 DNS 档=" + dns + "，清未完成暂存=" + tmp + " 个");
+            startDiag();
+        } catch (Throwable t) { log("onAppStart failed: " + rootMessage(t)); }
+    }
+
+    private static int deleteTmp(File dir) {
+        int n = 0;
+        File[] list = dir == null ? null : dir.listFiles();
+        if (list == null) return 0;
+        for (File f : list) {
+            if (f.isDirectory()) n += deleteTmp(f);
+            else if (f.getName().endsWith(".tmp") && f.delete()) n++;
         }
-        try { String h = new java.net.URI(s.replace("\\/", "/")).getHost(); return h == null ? "(解析不了)" : h; }
-        catch (Throwable t) { return "(解析不了)"; }
+        return n;
+    }
+
+    // ───────────── 2 / 3. DNS ─────────────
+
+    private static volatile Object dnsInstance;
+    private static volatile Method dnsPersist;
+    private static final List<Map<?, ?>> DNS_MAPS = new ArrayList<>();
+    private static final Map<String, Long> HOST_CLEARED = new ConcurrentHashMap<>();
+
+    /** 插在作者 DNS 查询方法（OkHttp Dns.lookup）最前面：认出它的快取。 */
+    public static void dnsSeen(Object dns) {
+        if (dnsInstance != null || dns == null) return;
+        try {
+            Class<?> c = dns.getClass();
+            synchronized (DNS_MAPS) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (!Modifier.isStatic(f.getModifiers()) || !Map.class.isAssignableFrom(f.getType())) continue;
+                    f.setAccessible(true);
+                    Object m = f.get(null);
+                    if (m instanceof Map) DNS_MAPS.add((Map<?, ?>) m);
+                }
+            }
+            for (Method m : c.getDeclaredMethods()) {
+                if (Modifier.isStatic(m.getModifiers()) || m.getParameterTypes().length != 0 || m.getReturnType() != void.class) continue;
+                m.setAccessible(true); dnsPersist = m; break;
+            }
+            dnsInstance = dns;
+        } catch (Throwable t) { log("dnsSeen failed: " + rootMessage(t)); }
+    }
+
+    /** 插在「改问大陆公共 DNS」那一支：这个结果 60 秒后丢掉，下次重新问系统 DNS。 */
+    public static void dnsPublic(final String host) {
+        if (host == null) return;
+        ev("系统 DNS 查不到，改用大陆公共 DNS：" + host + "（60 秒后作废）");
+        Thread t = new Thread(() -> {
+            try { Thread.sleep(60_000L); } catch (InterruptedException ignored) {}
+            dropHost(host);
+        }, "hgtv-dns-expire");
+        t.setDaemon(true); t.start();
+    }
+
+    private static boolean dropHost(String host) {
+        boolean any = false;
+        synchronized (DNS_MAPS) { for (Map<?, ?> m : DNS_MAPS) any |= m.remove(host) != null; }
+        persistDns();
+        return any;
+    }
+
+    private static void persistDns() {
+        try { Object d = dnsInstance; Method m = dnsPersist; if (d != null && m != null) m.invoke(d); } catch (Throwable ignored) {}
+    }
+
+    static void clearHost(String host, String why) {
+        if (host == null || host.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        Long last = HOST_CLEARED.get(host);
+        if (last != null && now - last < 30_000L) return;
+        HOST_CLEARED.put(host, now);
+        dropHost(host);
+        DNS_CLEARS.incrementAndGet();
+        ev("清 DNS " + host + "（" + why + "）");
+    }
+
+    static void clearAllDns(String why) {
+        synchronized (DNS_MAPS) { for (Map<?, ?> m : DNS_MAPS) m.clear(); }
+        File cache = appCacheDir;
+        if (cache != null) new File(cache, "dns-v1.txt").delete();
+        persistDns();
+        DNS_CLEARS.incrementAndGet();
+        ev("清全部 DNS（" + why + "）");
+    }
+
+    // ───────────── 2. 播放失败 ─────────────
+
+    private static volatile String curFid = "";
+    private static final Map<String, List<Long>> FAILS = new ConcurrentHashMap<>();
+    private static volatile long lastTmpClean;
+
+    /** 插在作者的播放失败上报（stage = playback_io / playback_prepare / playback_stall_buffer …）最前面。 */
+    public static void onFailure(Throwable error, String stage) {
+        try {
+            FAILURES.incrementAndGet();
+            String fid = curFid;
+            Line line = LINES.get(fid);
+            ev("播放失败 stage=" + stage + " err=" + (error == null ? "-" : rootMessage(error))
+                    + " 线路=" + (line == null ? "?" : (line.usingBackup ? "备用 " : "主 ") + line.current()));
+            if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
+            if (line != null) clearHost(line.current(), stage);
+            if (stage.contains("prepare")) {
+                long now = System.currentTimeMillis();
+                if (now - lastTmpClean > 60_000L) { lastTmpClean = now; int n = deleteTmp(appCacheDir == null ? null : new File(appCacheDir, "playback-v1")); if (n > 0) ev("清未完成暂存 " + n + " 个"); }
+            }
+            List<Long> times = FAILS.get(fid);
+            if (times == null) { times = new ArrayList<>(); FAILS.put(fid, times); }
+            long now = System.currentTimeMillis();
+            synchronized (times) {
+                times.add(now);
+                for (Iterator<Long> it = times.iterator(); it.hasNext(); ) if (now - it.next() > 180_000L) it.remove();
+                if (times.size() >= 2) { times.clear(); clearAllDns("同一集 3 分钟内失败 2 次"); }
+            }
+        } catch (Throwable t) { log("onFailure hook failed: " + rootMessage(t)); }
+    }
+
+    // ───────────── 4. 主 / 备线路轮替 ─────────────
+
+    private static final class Line {
+        String mainHost = "-", backupHost = "-"; int fetches; long last; boolean usingBackup;
+        String current() { return usingBackup ? backupHost : mainHost; }
+    }
+    private static final Map<String, Line> LINES = new ConcurrentHashMap<>();
+
+    /** 插在作者解析 main_url 之前（参数是这一档影片的 JSONObject）。同一集重取地址时主 / 备轮流。 */
+    public static void pickLine(Object video) {
+        try {
+            if (!(video instanceof org.json.JSONObject)) return;
+            org.json.JSONObject o = (org.json.JSONObject) video;
+            String fid = o.optString("file_id", "");
+            if (fid.isEmpty()) fid = o.optString("file_hash", "");
+            String main = o.optString("main_url", "");
+            String backup = plainUrl(o.optString("backup_url_1", ""));
+            long now = System.currentTimeMillis();
+            Line l = LINES.get(fid);
+            if (l == null || now - l.last > 180_000L) { l = new Line(); LINES.put(fid, l); }
+            if (LINES.size() > 50) LINES.clear();
+            l.fetches++; l.last = now;
+            l.mainHost = hostOf(plainUrl(main)); l.backupHost = hostOf(backup);
+            curFid = fid;
+            boolean wantBackup = l.fetches % 2 == 0 && backup.startsWith("http");
+            if (wantBackup) {
+                o.put("main_url", backup);
+                l.usingBackup = true;
+                LINE_SWITCHES.incrementAndGet();
+                ev("线路 第" + l.fetches + "次取地址 → 备用 " + l.backupHost + "（主 " + l.mainHost + "）");
+            } else {
+                l.usingBackup = false;
+                if (l.fetches > 1) ev("线路 第" + l.fetches + "次取地址 → 主 " + l.mainHost);
+            }
+        } catch (Throwable t) { log("pickLine failed: " + rootMessage(t)); }
+    }
+
+    /** 平台的网址可能是明文、带 \/ 跳脱，或 base64。统一转成明文网址；转不了就回传空字串。 */
+    private static String plainUrl(String s) {
+        if (s == null) return "";
+        s = s.trim().replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&");
+        if (s.startsWith("http")) return s;
+        if (s.isEmpty()) return "";
+        try {
+            String d = new String(android.util.Base64.decode(s, android.util.Base64.DEFAULT), "UTF-8").trim();
+            return d.startsWith("http") ? d : "";
+        } catch (Throwable t) { return ""; }
+    }
+
+    private static String hostOf(String url) {
+        if (url == null || url.isEmpty()) return "-";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("^https?://([^/:?#]+)").matcher(url);
+        return m.find() ? m.group(1) : "(?)";
+    }
+
+    // ───────────── 5. 诊断页 ─────────────
+
+    private static volatile boolean diagStarted;
+
+    private static void startDiag() {
+        if (diagStarted) return;
+        diagStarted = true;
+        Thread t = new Thread(() -> {
+            try (java.net.ServerSocket server = new java.net.ServerSocket(DIAG_PORT)) {
+                ev("诊断页已开：http://<电视IP>:" + DIAG_PORT + "/diag");
+                while (true) {
+                    try (java.net.Socket s = server.accept()) {
+                        s.setSoTimeout(5_000);
+                        java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
+                        String first = in.readLine();
+                        String body = first != null && first.startsWith("GET /diag") ? report() : "HGTV 修补版：请开 /diag\n";
+                        byte[] bytes = body.getBytes("UTF-8");
+                        java.io.OutputStream out = s.getOutputStream();
+                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: " + bytes.length + "\r\n\r\n").getBytes("UTF-8"));
+                        out.write(bytes);
+                        out.flush();
+                    } catch (Throwable ignored) {}
+                }
+            } catch (Throwable e) { ev("诊断页开不起来：" + rootMessage(e)); }
+        }, "hgtv-diag");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static String report() {
+        StringBuilder b = new StringBuilder();
+        b.append("HGTV 修补版诊断\n");
+        b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
+        b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
+        b.append("清 DNS ").append(DNS_CLEARS.get()).append(" 次 / 换备用线路 ").append(LINE_SWITCHES.get()).append(" 次 / 播放失败 ").append(FAILURES.get()).append(" 次\n");
+        Line l = LINES.get(curFid);
+        if (l != null) b.append("目前这集：主 ").append(l.mainHost).append(" / 备 ").append(l.backupHost).append(" / 正在用 ").append(l.usingBackup ? "备用" : "主").append(" / 取地址 ").append(l.fetches).append(" 次\n");
+        b.append("\n===== 修补事件（最近 ").append(EVENT_MAX).append(" 条，含之前启动的） =====\n");
+        synchronized (EVENTS) { for (String e : EVENTS) b.append(e).append('\n'); }
+        b.append("\n===== 本 App 的 log（最近 800 行） =====\n");
+        b.append(appLog());
+        return b.toString();
+    }
+
+    private static String appLog() {
+        int pid = android.os.Process.myPid();
+        String[][] tries = { {"logcat", "-d", "-v", "time", "-t", "800", "--pid=" + pid}, {"logcat", "-d", "-v", "time", "-t", "3000"} };
+        for (String[] cmd : tries) {
+            try {
+                java.lang.Process p = Runtime.getRuntime().exec(cmd);
+                StringBuilder out = new StringBuilder();
+                try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream(), "UTF-8"))) {
+                    String needle = "(" + pid + ")";
+                    for (String line; (line = r.readLine()) != null; ) {
+                        if (cmd.length == 6 && !line.contains(needle) && !line.contains(" " + pid + " ")) continue;
+                        out.append(line).append('\n');
+                    }
+                }
+                p.waitFor();
+                if (out.length() > 0) return out.toString();
+            } catch (Throwable ignored) {}
+        }
+        return "（读不到 log）\n";
     }
 
     // ───────────────────────────── 工具 ─────────────────────────────
