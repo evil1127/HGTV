@@ -838,6 +838,41 @@ public final class Hooks {
         return false;
     }
 
+    // ───────────── 6. 起播准备限时 ─────────────
+    // 起播前作者会先抓影片开头（约 2 MB）。这一步原本跟一般下载共用 25 秒总时限，卡死时要等满 25 秒才放弃。
+    // 只给这一步 10 秒：超过就关掉这个读取器，作者会当成失败、重取地址（轮替线路）再来。一般播放中的下载不受影响。
+
+    private static final long PREPARE_LIMIT_MS = 10_000L;
+    private static final java.util.concurrent.ScheduledExecutorService WATCH = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "hgtv-prepare-watch");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final Map<Object, java.util.concurrent.ScheduledFuture<?>> PREPARING =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Object, java.util.concurrent.ScheduledFuture<?>>());
+
+    /** 插在作者「起播准备」方法最前面。 */
+    public static void prepareBegin(final Object reader) {
+        if (reader == null) return;
+        try {
+            java.util.concurrent.ScheduledFuture<?> f = WATCH.schedule(() -> {
+                if (PREPARING.remove(reader) == null) return;
+                ev("起播准备超过 " + PREPARE_LIMIT_MS / 1000 + " 秒，提早放弃，改重取地址");
+                try { if (reader instanceof Closeable) ((Closeable) reader).close(); } catch (Throwable ignored) {}
+            }, PREPARE_LIMIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            java.util.concurrent.ScheduledFuture<?> old = PREPARING.put(reader, f);
+            if (old != null) old.cancel(false);
+        } catch (Throwable t) { log("prepareBegin failed: " + rootMessage(t)); }
+    }
+
+    /** 插在「起播准备」每个正常结束的 return 前面。 */
+    public static void prepareEnd(Object reader) {
+        try {
+            java.util.concurrent.ScheduledFuture<?> f = PREPARING.remove(reader);
+            if (f != null) f.cancel(false);
+        } catch (Throwable ignored) {}
+    }
+
     // ───────────── 4. 主 / 备线路轮替 ─────────────
 
     private static final class Line {
