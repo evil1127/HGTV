@@ -121,11 +121,25 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.pick.outputs.tag }}"
-          notes="以官方 ${tag}（${UPSTREAM}）为底，加上预载：当前集与后面 3 集整集预先下载。包名 com.hgtv.star.preload，可与官方版并存。"
+          stamp=$(TZ=Asia/Taipei date +%Y%m%d-%H%M)
+          dated="HGTV_preload_${tag#v}_${stamp}.apk"
+          cp "$OUT" "$dated"
+          {
+            echo "以作者 ${tag}（${UPSTREAM}）为底的修补版。包名 com.hgtv.star.preload，可与作者版并存。"
+            echo
+            echo "**本次修补（${stamp}，台湾时间）**"
+            echo
+            cat patch-report.md
+            echo
+            echo "诊断页：App 开着时，用同一个网络的电脑打开 http://<电视IP>:18321/diag"
+            echo
+            echo "每次打包都另存一份带时间的 APK（例如 ${dated}），新版有问题可以装回旧的。"
+          } > notes.md
           if gh release view "preload-$tag" >/dev/null 2>&1; then
-            gh release upload "preload-$tag" "$OUT" --clobber
+            gh release upload "preload-$tag" "$OUT" "$dated" --clobber
+            gh release edit "preload-$tag" --title "修补版 ${tag}" --notes-file notes.md
           else
-            gh release create "preload-$tag" "$OUT" --title "预载版 ${tag}" --notes "$notes"
+            gh release create "preload-$tag" "$OUT" "$dated" --title "修补版 ${tag}" --notes-file notes.md
           fi
 
       - uses: actions/upload-artifact@v4
