@@ -106,6 +106,44 @@ def patch_method(text, start, end, before, after_call, label):
     return text[:start] + "\n".join(out) + text[end:]
 
 
+def tune_stall_recovery(files):
+    """连线卡死时更快重连（1.2.9.1 实测：缓冲停住 30 秒才清连线池，清完 2 秒内就恢复）。
+    - 影片用的 OkHttp：连线 6 秒、读取 8 秒没资料就断、整个请求最多 25 秒（原本 8~15 / 30 / 45）。
+    - 「缓冲停止前进」看门狗：30 秒 → 10 秒，触发后官方会清连线池并在原位置重载。
+    找不到就只警告，不影响出包。"""
+    timeout_re = re.compile(
+        r"(const-wide/16 (v\d+), )0x(?:8|f)(\s+invoke-virtual \{[^}]+\}, (L[^;]+;)->b\(J\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x1e(\s+invoke-virtual \{[^}]+\}, \4->d\(J\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x2d(\s+invoke-virtual \{[^}]+\}, \4->a\(J\)V)")
+    clients = 0
+    for path, text in list(files.items()):
+        new, n = timeout_re.subn(lambda m: m.group(1) + "0x6" + m.group(3) + m.group(5) + "0x8" + m.group(7) + m.group(8) + "0x19" + m.group(10), text)
+        if n:
+            path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
+    print(f"tuned {clients} 个影片连线的逾时")
+    if clients == 0:
+        print("::warning::没找到影片连线的逾时设定（读取 30 秒 / 总计 45 秒），这一版没缩短")
+
+    stall_msg = "\\u64ad\\u653e\\u4e2d\\u7f13\\u51b2\\u505c\\u6b62\\u524d\\u8fdb 30 \\u79d2"
+    stall = 0
+    for path, text in list(files.items()):
+        if stall_msg not in text:
+            continue
+        for m in METHOD_RE.finditer(text):
+            body = m.group(5)
+            if stall_msg not in body:
+                continue
+            nb, n = re.subn(r"(const-wide/16 v\d+, )0x7530\b", r"\g<1>0x2710", body)
+            nb = nb.replace(stall_msg, stall_msg.replace(" 30 ", " 10 "))
+            if n == 1:
+                text = text[:m.start(5)] + nb + text[m.end(5):]
+                path.write_text(text, encoding="utf-8"); files[path] = text; stall += 1
+            break
+    print(f"tuned {stall} 处缓冲卡住看门狗（30 秒 → 10 秒）")
+    if stall == 0:
+        print("::warning::没找到「缓冲停止前进 30 秒」看门狗，这一版没缩短")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
@@ -180,6 +218,8 @@ def main():
             text = patch_method(text, s, e, before, after, label)
         path.write_text(text, encoding="utf-8"); files[path] = text
         print(f"patched {path.relative_to(root)} ({len(items)} 处)")
+
+    tune_stall_recovery(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
