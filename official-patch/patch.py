@@ -169,6 +169,20 @@ def tune_buffer(files):
     if done == 0:
         print("::warning::没找到播放缓冲设定（bufferForPlaybackAfterRebufferMs），这一版缓冲没加大")
 
+def add_video_probe(files):
+    """诊断：在解析 main_url 的地方记一行「这档影片有哪些栏位 / 各线路主机名」，确认有没有备用线路。只记录，不改行为。"""
+    probe_re = re.compile(r'(\n(\s*)const-string (v\d+), "main_url"\s+invoke-static \{(v\d+), \3\}, L[^;]+;->\w+\(Lorg/json/JSONObject;Ljava/lang/String;\)Ljava/lang/String;)')
+    hits = 0
+    for path, text in list(files.items()):
+        if "/novel/player/video_model/v1/" not in text:
+            continue
+        new, n = probe_re.subn(lambda m: "\n" + m.group(2) + "invoke-static/range {" + m.group(4) + " .. " + m.group(4) + "}, " + HOOKS + "->probeVideo(Ljava/lang/Object;)V\n" + m.group(1), text)
+        if n:
+            path.write_text(new, encoding="utf-8"); files[path] = new; hits += n
+    print(f"probe {hits} 处（备用线路诊断）")
+    if hits == 0:
+        print("::warning::没找到解析 main_url 的位置，这一版没有备用线路诊断")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -247,6 +261,7 @@ def main():
 
     tune_stall_recovery(files)
     tune_buffer(files)
+    add_video_probe(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
