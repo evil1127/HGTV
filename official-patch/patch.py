@@ -381,6 +381,10 @@ def main():
         print("::warning::application 的 label 不是写死的字串，名称沿用官方")
     if 'android:authorities="' in mtext:
         mtext = re.sub(r'android:authorities="([^"]+)"', lambda m: f'android:authorities="{m.group(1)}.preload"', mtext)
+    # androidx 自动宣告的「包名.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION」也要跟着改名，
+    # 否则和作者版装在同一台时会 INSTALL_FAILED_DUPLICATE_PERMISSION（执行时 androidx 本来就用新包名拼这个权限）。
+    mtext, n = re.subn(r'com\.hgtv\.star\.([A-Z0-9_]+_PERMISSION)', lambda m: f"{args.package}.{m.group(1)}", mtext)
+    report(True, f"自订权限改名（{n} 处），可与作者版并存")
     manifest.write_text(mtext, encoding="utf-8")
     pathlib.Path("patch-report.md").write_text("\n".join("- " + r for r in REPORT) + "\n", encoding="utf-8")
     print("\n".join(REPORT))
