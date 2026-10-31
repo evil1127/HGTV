@@ -144,6 +144,32 @@ def tune_stall_recovery(files):
         print("::warning::没找到「缓冲停止前进 30 秒」看门狗，这一版没缩短")
 
 
+def tune_buffer(files):
+    """播放缓冲加大（不降画质）：作者 1.2.9.1 是 min 20 秒 / max 60 秒 / 卡住后只等 2 秒就续播 / 24 MB。
+    短剧一集约 90 秒，改成整集先载完（min 90 秒、max 120 秒），卡住后先存 6 秒再播，容量 64 MB。
+    找不到就只警告。"""
+    marker = '"bufferForPlaybackAfterRebufferMs"'
+    done = 0
+    for path, text in list(files.items()):
+        if marker not in text or '"maxBufferMs"' not in text:
+            continue
+        for m in METHOD_RE.finditer(text):
+            body = m.group(5)
+            if marker not in body or '"maxBufferMs"' not in body:
+                continue
+            nb, a = re.subn(r"const/16 (v\d+), 0x7d0\b", r"const/16 \1, 0x1770", body, count=1)      # 卡住后续播 2 秒 → 6 秒
+            nb, b = re.subn(r"const/16 (v\d+), 0x4e20\b", r"const \1, 0x15f90", nb, count=1)         # min 20 秒 → 90 秒
+            nb, c = re.subn(r"const (v\d+), 0xea60\b", r"const \1, 0x1d4c0", nb, count=1)            # max 60 秒 → 120 秒
+            nb, d = re.subn(r"const/high16 (v\d+), 0x1800000\b", r"const/high16 \1, 0x4000000", nb, count=1)  # 24 MB → 64 MB
+            if a and b and c:
+                text = text[:m.start(5)] + nb + text[m.end(5):]
+                path.write_text(text, encoding="utf-8"); files[path] = text; done += 1
+                print(f"tuned buffer in {path.name}（续播 {a} / min {b} / max {c} / 容量 {d}）")
+            break
+    if done == 0:
+        print("::warning::没找到播放缓冲设定（bufferForPlaybackAfterRebufferMs），这一版缓冲没加大")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
@@ -220,6 +246,7 @@ def main():
         print(f"patched {path.relative_to(root)} ({len(items)} 处)")
 
     tune_stall_recovery(files)
+    tune_buffer(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
