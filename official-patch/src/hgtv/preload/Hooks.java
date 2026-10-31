@@ -102,6 +102,7 @@ public final class Hooks {
     // ───────────────────────────── 入口：取播放地址 ─────────────────────────────
 
     public static Object streamBefore(Object repo, String id, int quality) {
+        if (repo != null) repository = repo;   // 修补版：预载关着也要记下内容仓库（失败时清它快取的播放地址）
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
             STREAM_CALL.set(new Object[]{repo, id, quality, System.currentTimeMillis()});
@@ -756,7 +757,9 @@ public final class Hooks {
             ev("播放失败 stage=" + stage + " err=" + (error == null ? "-" : rootMessage(error))
                     + " 线路=" + (line == null ? "?" : (line.usingBackup ? "备用 " : "主 ") + line.current()));
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
-            if (line != null) clearHost(line.current(), stage);
+            if (line != null && !"-".equals(line.current())) clearHost(line.current(), stage);
+            int dropped = dropCachedStreams();
+            if (dropped > 0) ev("丢掉快取的播放地址 " + dropped + " 个（重载时重新取，可轮到备用线路）");
             if (stage.contains("prepare")) {
                 long now = System.currentTimeMillis();
                 if (now - lastTmpClean > 60_000L) { lastTmpClean = now; int n = deleteTmp(appCacheDir == null ? null : new File(appCacheDir, "playback-v1")); if (n > 0) ev("清未完成暂存 " + n + " 个"); }
@@ -770,6 +773,41 @@ public final class Hooks {
                 if (times.size() >= 2) { times.clear(); clearAllDns("同一集 3 分钟内失败 2 次"); }
             }
         } catch (Throwable t) { log("onFailure hook failed: " + rootMessage(t)); }
+    }
+
+    private static volatile long lastDrop;
+
+    /**
+     * 作者把取到的播放地址快取在内容仓库里（失效前一直重用）。缓冲卡住时作者只清连线池、用同一个地址重载，
+     * 同一个坏节点就会一直卡在同一秒。这里把快取里的播放地址丢掉，逼重载时重新取（会经过 pickLine 轮替线路）。
+     */
+    static int dropCachedStreams() {
+        long now = System.currentTimeMillis();
+        if (now - lastDrop < 8_000L) return 0;
+        lastDrop = now;
+        Object repo = repository;
+        if (repo == null) return 0;
+        int n = 0;
+        try {
+            for (Field f : allFields(repo.getClass())) {
+                if (!Map.class.isAssignableFrom(f.getType())) continue;
+                f.setAccessible(true);
+                Object m = f.get(repo);
+                if (!(m instanceof Map)) continue;
+                for (Iterator<?> it = ((Map<?, ?>) m).values().iterator(); it.hasNext(); ) {
+                    Object v = it.next();
+                    if (v != null && holdsStream(v.getClass())) { it.remove(); n++; }
+                }
+            }
+        } catch (Throwable t) { log("dropCachedStreams failed: " + rootMessage(t)); }
+        return n;
+    }
+
+    private static boolean holdsStream(Class<?> c) {
+        if (c.getName().startsWith("java.")) return false;
+        if (looksLikeStream(c)) return true;
+        for (Field f : allFields(c)) if (!f.getType().isPrimitive() && !f.getType().getName().startsWith("java.") && looksLikeStream(f.getType())) return true;
+        return false;
     }
 
     // ───────────── 4. 主 / 备线路轮替 ─────────────
