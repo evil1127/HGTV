@@ -288,6 +288,24 @@ def limit_prepare(files, reader_path):
         reader_path.write_text(text, encoding="utf-8"); files[reader_path] = text
     report(ok, "起播准备限 10 秒（只限开头这一步，一般下载仍 25 秒）" + ("" if ok else f"：找到 {len(hits)} 个起播准备方法"))
 
+def tune_pool(files):
+    """闲置连线只留 15 秒（OkHttp 默认 5 分钟）。
+    缓冲加大后整集很早就载完，连线闲置一两分钟会被 CDN / 路由默默断掉；下一集再拿这条死连线就卡到逾时。
+    实测：切集第一下常卡满 25 秒，清掉连线池后立刻就好。这里让闲置连线 15 秒就关，下一集一定开新连线。"""
+    hits = method_bodies(files, lambda p, x, m: m.group(2) == "<init>" and '" ConnectionPool"' in m.group(5) and "TimeUnit;->MINUTES" in m.group(5))
+    ok = False
+    if len(hits) == 1:
+        path, m = hits[0]
+        body = m.group(5)
+        nb, a = re.subn(r"sget-object (v\d+), Ljava/util/concurrent/TimeUnit;->MINUTES:Ljava/util/concurrent/TimeUnit;", r"sget-object \1, Ljava/util/concurrent/TimeUnit;->SECONDS:Ljava/util/concurrent/TimeUnit;", body)
+        nb, b = re.subn(r"const-wide/16 (v\d+), 0x5\n", r"const-wide/16 \1, 0xf\n", nb)
+        if a == 1 and b == 1:
+            text = files[path]
+            text = text[:m.start(5)] + nb + text[m.end(5):]
+            path.write_text(text, encoding="utf-8"); files[path] = text
+            ok = True
+    report(ok, "闲置连线只留 15 秒（切集不再拿到被断掉的旧连线）" + ("" if ok else "：找不到连线池设定"))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -369,6 +387,7 @@ def main():
     add_fix_hooks(files)
     tune_warm(files)
     limit_prepare(files, ranges[0][0])
+    tune_pool(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
