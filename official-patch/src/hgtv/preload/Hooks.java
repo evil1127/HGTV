@@ -852,8 +852,14 @@ public final class Hooks {
             java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Object, java.util.concurrent.ScheduledFuture<?>>());
 
     /** 插在作者「起播准备」方法最前面。 */
+    /**
+     * 2026-11-01 实测后关闭：背景「暖机下一集」也走这个方法，正常就要 10 秒以上，被砍掉后下一集反而没准备好；
+     * 还会砍到稍后要拿来播放的读取器（播放中跳「播放请求已取消」）。闲置连线改 15 秒后，卡 25 秒的主因已处理。
+     */
+    private static final boolean PREPARE_LIMIT_ON = false;
+
     public static void prepareBegin(final Object reader) {
-        if (reader == null) return;
+        if (!PREPARE_LIMIT_ON || reader == null) return;
         try {
             java.util.concurrent.ScheduledFuture<?> f = WATCH.schedule(() -> {
                 if (PREPARING.remove(reader) == null) return;
@@ -962,7 +968,7 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理、主备轮替、起播限时10秒、闲置连线15秒）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理、主备轮替、闲置连线15秒；起播限时已关）\n");
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
         b.append("清 DNS ").append(DNS_CLEARS.get()).append(" 次 / 换备用线路 ").append(LINE_SWITCHES.get()).append(" 次 / 播放失败 ").append(FAILURES.get()).append(" 次\n");
