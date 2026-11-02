@@ -103,6 +103,7 @@ public final class Hooks {
 
     public static Object streamBefore(Object repo, String id, int quality) {
         if (repo != null) repository = repo;   // 修补版：预载关着也要记下内容仓库（失败时清它快取的播放地址）
+        if (id != null) { FETCHED_AT.put(id, System.currentTimeMillis()); if (FETCHED_AT.size() > 200) FETCHED_AT.clear(); }
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
             STREAM_CALL.set(new Object[]{repo, id, quality, System.currentTimeMillis()});
@@ -785,7 +786,7 @@ public final class Hooks {
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
             if (line != null && line.current().contains(".")) clearHost(line.current(), stage);
             // 2. 记住哪条线路刚出事：主线路失败 → 接下来 10 分钟每集先用备用；备用失败 → 回到先用主线路。
-            if (line != null) {
+            if (STICKY_LINE && line != null) {
                 boolean was = System.currentTimeMillis() < preferBackupUntil;
                 preferBackupUntil = line.usingBackup ? 0 : System.currentTimeMillis() + 10 * 60_000L;
                 boolean now = System.currentTimeMillis() < preferBackupUntil;
@@ -817,10 +818,34 @@ public final class Hooks {
     private static volatile String curPlayId;
     /** 这个时间之前，每集第一次取地址先用备用线路。 */
     private static volatile long preferBackupUntil;
+    /** 2026-11-02 实测关闭：备用线路并不比主线路稳（失败 6 次 vs 3 次），只会来回切换。改回单纯的主 / 备轮流。 */
+    private static final boolean STICKY_LINE = false;
+    /** 每一集最后一次向平台取到播放地址的时间（不论是起播还是背景暖机）。 */
+    private static final Map<String, Long> FETCHED_AT = new ConcurrentHashMap<>();
+    /** 预先取好的地址放超过这么久才要起播，就先换一个新的。 */
+    private static final long STALE_URL_MS = 30_000L;
 
-    /** 插在作者「起播准备」最前面（拿到这次要播的集数 ID 之后）。 */
-    public static void playStarting(String id) {
-        if (id != null && !id.isEmpty()) curPlayId = id;
+    /**
+     * 插在作者「起播准备」最前面（拿到这次要播的集数 ID 与「背景准备好的读取器」之后）。
+     * 实测：每集第一次起播常失败、重取新地址后几秒就好 → 背景预先取的地址放久了会失效。
+     * 这里：地址是 30 秒以前取的，就把它（含背景准备好的读取器）丢掉，回传 true 让作者当成没有、重新取新地址起播。
+     */
+    public static boolean playStarting(String id, Object pooledReader) {
+        if (id == null || id.isEmpty()) return false;
+        curPlayId = id;
+        try {
+            Long t = FETCHED_AT.get(id);
+            long age = t == null ? -1 : System.currentTimeMillis() - t;
+            if (age < STALE_URL_MS) return false;
+            lastDrop = 0;
+            int dropped = dropCachedStreams(id);
+            int files = appCacheDir == null ? 0 : deleteMatching(new File(appCacheDir, "playback-v1"), "url-", id);
+            boolean hadReader = pooledReader != null;
+            if (pooledReader instanceof Closeable) try { ((Closeable) pooledReader).close(); } catch (Throwable ignored) {}
+            ev("起播前换新地址：第 " + id + " 集的地址已放 " + age / 1000 + " 秒（丢掉快取 " + dropped + " 个、地址档 " + files + " 个" + (hadReader ? "、背景读取器 1 个" : "") + "）");
+            FETCHED_AT.remove(id);
+            return true;
+        } catch (Throwable e) { log("playStarting failed: " + rootMessage(e)); return false; }
     }
     private static volatile long lastDiskDrop;
 
@@ -869,7 +894,7 @@ public final class Hooks {
     // 起播前作者会先抓影片开头（约 2 MB）。这一步原本跟一般下载共用 25 秒总时限，卡死时要等满 25 秒才放弃。
     // 只给这一步 10 秒：超过就关掉这个读取器，作者会当成失败、重取地址（轮替线路）再来。一般播放中的下载不受影响。
 
-    private static final long PREPARE_LIMIT_MS = 10_000L;
+    private static final long PREPARE_LIMIT_MS = 12_000L;
     private static final java.util.concurrent.ScheduledExecutorService WATCH = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "hgtv-prepare-watch");
         t.setDaemon(true);
@@ -880,10 +905,10 @@ public final class Hooks {
 
     /** 插在作者「起播准备」方法最前面。 */
     /**
-     * 2026-11-01 实测后关闭：背景「暖机下一集」也走这个方法，正常就要 10 秒以上，被砍掉后下一集反而没准备好；
-     * 还会砍到稍后要拿来播放的读取器（播放中跳「播放请求已取消」）。闲置连线改 15 秒后，卡 25 秒的主因已处理。
+     * 2026-11-02 起只挂在「前景起播」那一处（作者起播准备方法里呼叫读取器准备的地方），背景暖机不经过这里。
+     * （11-01 版挂在读取器自己的准备方法上，连背景暖机一起砍，已撤掉。）
      */
-    private static final boolean PREPARE_LIMIT_ON = false;
+    private static final boolean PREPARE_LIMIT_ON = true;
 
     public static void prepareBegin(final Object reader) {
         if (!PREPARE_LIMIT_ON || reader == null) return;
@@ -996,7 +1021,7 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮替+记住好线路、闲置连线15秒、不自动降画质；起播限时已关）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>30秒)、前景起播限12秒、闲置连线15秒、不自动降画质、自动重试不停）\n");
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
