@@ -1123,27 +1123,39 @@ public final class Hooks {
 
     // ───── 换集等待时间（诊断页最上面的摘要用） ─────
     private static final Map<String, Long> SWITCH_START = new ConcurrentHashMap<>();
-    /** 最近 20 次换集：{等了几毫秒, 是否预载直接播(1/0)}。 */
+    /** 最近 30 次换集（这次开 App 以来，不存档）：{等了几毫秒, 是否预载直接播(1/0)}。 */
     private static final java.util.ArrayDeque<long[]> WAITS = new java.util.ArrayDeque<>();
 
     static long recordWait(String id, boolean preload) {
         Long st = id == null ? null : SWITCH_START.remove(id);
         if (st == null) return -1;
         long ms = Math.max(0, System.currentTimeMillis() - st);
-        synchronized (WAITS) { WAITS.addLast(new long[]{ms, preload ? 1 : 0}); while (WAITS.size() > 20) WAITS.removeFirst(); }
-        saveNodes();
+        addWait(ms, preload);
         return ms;
+    }
+
+    private static void addWait(long ms, boolean preload) {
+        synchronized (WAITS) { WAITS.addLast(new long[]{ms, preload ? 1 : 0}); while (WAITS.size() > 30) WAITS.removeFirst(); }
+    }
+
+    /** 插在作者「预载好的下一集直接接上播」那一处：这次换集不用等。 */
+    public static void seamlessSwitch() {
+        try { addWait(0, true); } catch (Throwable ignored) {}
     }
 
     private static String summary() {
         StringBuilder b = new StringBuilder();
         synchronized (WAITS) {
-            if (WAITS.isEmpty()) b.append("最近换集：还没有纪录");
+            if (WAITS.isEmpty()) b.append("这次开 App 以来还没换过集");
             else {
-                long sum = 0, max = 0; int fast = 0, pre = 0;
-                for (long[] w : WAITS) { sum += w[0]; max = Math.max(max, w[0]); if (w[0] <= 5000) fast++; if (w[1] == 1) pre++; }
-                b.append(String.format(java.util.Locale.US, "最近 %d 次换集：平均等 %.1f 秒、最久 %.1f 秒、5 秒内 %d 次（预载直接播 %d 次）",
-                        WAITS.size(), sum / 1000.0 / WAITS.size(), max / 1000.0, fast, pre));
+                int pre = 0, slow = 0, fast = 0; long sum = 0, max = 0;
+                for (long[] w : WAITS) {
+                    if (w[1] == 1) { pre++; fast++; continue; }
+                    slow++; sum += w[0]; max = Math.max(max, w[0]); if (w[0] <= 5000) fast++;
+                }
+                b.append("最近 ").append(WAITS.size()).append(" 次换集：预载直接播 ").append(pre).append(" 次");
+                if (slow > 0) b.append(String.format(java.util.Locale.US, "、重新起播 %d 次（平均等 %.1f 秒、最久 %.1f 秒）", slow, sum / 1000.0 / slow, max / 1000.0));
+                b.append(String.format(java.util.Locale.US, "；5 秒内 %d%%", fast * 100 / WAITS.size()));
             }
         }
         StringBuilder bad = new StringBuilder();
@@ -1166,7 +1178,6 @@ public final class Hooks {
                 if (h[1] < old && h[2] < System.currentTimeMillis() && h[3] == 0 && h[0] == 0) continue;
                 b.append("N\t").append(e.getKey()).append('\t').append(h[0]).append('\t').append(h[1]).append('\t').append(h[2]).append('\t').append(h[3]).append('\n');
             }
-            synchronized (WAITS) { for (long[] w : WAITS) b.append("W\t").append(w[0]).append('\t').append(w[1]).append('\n'); }
             synchronized (HEALTH) {
                 try (java.io.FileOutputStream out = new java.io.FileOutputStream(f, false)) { out.write(b.toString().getBytes("UTF-8")); }
             }
@@ -1184,8 +1195,6 @@ public final class Hooks {
                     if (s.length == 6 && "N".equals(s[0])) {
                         HEALTH.put(s[1], new long[]{Long.parseLong(s[2]), Long.parseLong(s[3]), Long.parseLong(s[4]), Long.parseLong(s[5])});
                         n++; if (isBad(s[1])) bad++;
-                    } else if (s.length == 3 && "W".equals(s[0])) {
-                        synchronized (WAITS) { WAITS.addLast(new long[]{Long.parseLong(s[1]), Long.parseLong(s[2])}); }
                     }
                 } catch (NumberFormatException ignored) {}
             }
