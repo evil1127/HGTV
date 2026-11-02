@@ -286,7 +286,7 @@ def limit_prepare(files, reader_path):
         body = "\n".join(lines)
         text = text[:m.start(5)] + body + text[m.end(5):]
         reader_path.write_text(text, encoding="utf-8"); files[reader_path] = text
-    report(ok, "起播准备限 10 秒（只限开头这一步，一般下载仍 25 秒）" + ("" if ok else f"：找到 {len(hits)} 个起播准备方法"))
+    report(ok, "起播准备限时挂钩（Hooks 里目前关闭，仍 25 秒）" + ("" if ok else f"：找到 {len(hits)} 个起播准备方法"))
 
 def tune_pool(files):
     """闲置连线只留 15 秒（OkHttp 默认 5 分钟）。
@@ -305,6 +305,39 @@ def tune_pool(files):
             path.write_text(text, encoding="utf-8"); files[path] = text
             ok = True
     report(ok, "闲置连线只留 15 秒（切集不再拿到被断掉的旧连线）" + ("" if ok else "：找不到连线池设定"))
+
+def hook_play_start(files):
+    """起播准备（会丢 PlaybackPrepareException 的那个方法）一拿到集数 ID 就告诉 Hooks.playStarting，失败时只清这一集。"""
+    hits = method_bodies(files, lambda p, x, m: "PlaybackPrepareException;-><init>" in m.group(5) and "static" not in m.group(1).split())
+    ok = False
+    if len(hits) == 1:
+        path, m = hits[0]
+        body = m.group(5)
+        nb, n = re.subn(r"(\n(\s*)iget-object (v\d+), p0, L[^;]+;->\w+:Ljava/lang/String;\n)", lambda mm: mm.group(1) + "\n" + mm.group(2) + "invoke-static/range {" + mm.group(3) + " .. " + mm.group(3) + "}, " + HOOKS + "->playStarting(Ljava/lang/String;)V\n", body, count=1)
+        if n == 1:
+            text = files[path]
+            text = text[:m.start(5)] + nb + text[m.end(5):]
+            path.write_text(text, encoding="utf-8"); files[path] = text
+            ok = True
+    report(ok, "失败时只清「这一集」的快取（不动背景已准备好的下一集）" + ("" if ok else f"：起播准备方法找到 {len(hits)} 个"))
+
+
+def no_quality_down(files):
+    """不自动降画质：作者的「降档」预算（QUALITY_DOWN，原本 2 次）改成 0 次；同画质重建（SAME_QUALITY_REBUILD）照旧。"""
+    enum = [p for p, x in files.items() if '"QUALITY_DOWN"' in x and '"SAME_QUALITY_REBUILD"' in x]
+    ok = False
+    if len(enum) == 1:
+        ecls = class_name(files[enum[0]])
+        hits = method_bodies(files, lambda p, x, m: m.group(4) == "Z" and m.group(3).startswith(ecls) and "static" not in m.group(1).split() and re.search(r"const/4 p1, 0x2\n", m.group(5)))
+        if len(hits) == 1:
+            path, m = hits[0]
+            nb, n = re.subn(r"const/4 p1, 0x2\n", "const/4 p1, 0x0\n", m.group(5))
+            if n == 1:
+                text = files[path]
+                text = text[:m.start(5)] + nb + text[m.end(5):]
+                path.write_text(text, encoding="utf-8"); files[path] = text
+                ok = True
+    report(ok, "不自动降画质（降档预算 2 → 0，出错改用同画质重建 / 换线路重试）" + ("" if ok else "：找不到降档预算"))
 
 
 def main():
@@ -388,6 +421,8 @@ def main():
     tune_warm(files)
     limit_prepare(files, ranges[0][0])
     tune_pool(files)
+    hook_play_start(files)
+    no_quality_down(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
