@@ -272,21 +272,33 @@ def tune_warm(files):
     report(ok, "下一集提早暖机（剩 75 秒开始，失败每 4 秒重试、最多 7 次）" + ("" if ok else "：找不到作者的暖机条件"))
 
 def limit_prepare(files, reader_path):
-    """起播准备（读取器里含 "prepared" 的无参方法）限 10 秒：开头 / 每个 return-void 前挂上 Hooks.prepareBegin / prepareEnd。"""
-    text = files[reader_path]
-    hits = [m for m in METHOD_RE.finditer(text) if "static" not in m.group(1).split() and m.group(3) == "" and m.group(4) == "V" and '"prepared"' in m.group(5)]
-    ok = len(hits) == 1
-    if ok:
-        m = hits[0]
-        body = m.group(5)
-        body = re.sub(r"(\n(\s*)return-void)", lambda mm: "\n" + mm.group(2) + "invoke-static/range {p0 .. p0}, " + HOOKS + "->prepareEnd(Ljava/lang/Object;)V\n" + mm.group(1), body)
-        lines = body.split("\n")
-        idx = first_code_index(lines)
-        lines.insert(idx, "    invoke-static/range {p0 .. p0}, " + HOOKS + "->prepareBegin(Ljava/lang/Object;)V\n")
-        body = "\n".join(lines)
-        text = text[:m.start(5)] + body + text[m.end(5):]
-        reader_path.write_text(text, encoding="utf-8"); files[reader_path] = text
-    report(ok, "起播准备限时挂钩（Hooks 里目前关闭，仍 25 秒）" + ("" if ok else f"：找到 {len(hits)} 个起播准备方法"))
+    """前景起播限 12 秒：只在「起播准备」方法（会丢 PlaybackPrepareException 的那个）呼叫读取器 prepare 的地方前后挂
+    Hooks.prepareBegin / prepareEnd。背景暖机（同一个读取器 prepare 方法被别处呼叫）不受限制。"""
+    rcls = class_name(files[reader_path])
+    hits = [m for m in METHOD_RE.finditer(files[reader_path]) if "static" not in m.group(1).split() and m.group(3) == "" and m.group(4) == "V" and '"prepared"' in m.group(5)]
+    ok = False
+    detail = f"：读取器 prepare 方法找到 {len(hits)} 个"
+    if len(hits) == 1:
+        pname = hits[0].group(2)
+        sites = method_bodies(files, lambda p, x, m: "PlaybackPrepareException;-><init>" in m.group(5) and "static" not in m.group(1).split())
+        detail = f"：起播准备方法找到 {len(sites)} 个"
+        if len(sites) == 1:
+            path, m = sites[0]
+            pat = re.compile(r"\n(\s*)invoke-virtual \{(v\d+)\}, " + re.escape(rcls) + "->" + re.escape(pname) + r"\(\)V\n")
+            found = pat.findall(m.group(5))
+            detail = f"：前景呼叫点找到 {len(found)} 个"
+            if len(found) == 1:
+                def rep(mm):
+                    ind, r = mm.group(1), mm.group(2)
+                    return ("\n" + ind + "invoke-static/range {" + r + " .. " + r + "}, " + HOOKS + "->prepareBegin(Ljava/lang/Object;)V\n"
+                            + "\n" + ind + "invoke-virtual {" + r + "}, " + rcls + "->" + pname + "()V\n"
+                            + "\n" + ind + "invoke-static/range {" + r + " .. " + r + "}, " + HOOKS + "->prepareEnd(Ljava/lang/Object;)V\n")
+                nb = pat.sub(rep, m.group(5), count=1)
+                text = files[path]
+                text = text[:m.start(5)] + nb + text[m.end(5):]
+                path.write_text(text, encoding="utf-8"); files[path] = text
+                ok = True
+    report(ok, "前景起播限 12 秒（背景暖机不限）" + ("" if ok else detail))
 
 def tune_pool(files):
     """闲置连线只留 15 秒（OkHttp 默认 5 分钟）。
@@ -306,20 +318,77 @@ def tune_pool(files):
             ok = True
     report(ok, "闲置连线只留 15 秒（切集不再拿到被断掉的旧连线）" + ("" if ok else "：找不到连线池设定"))
 
-def hook_play_start(files):
-    """起播准备（会丢 PlaybackPrepareException 的那个方法）一拿到集数 ID 就告诉 Hooks.playStarting，失败时只清这一集。"""
+def hook_play_start(files, reader_path):
+    """起播准备一拿到集数 ID 就呼叫 Hooks.playStarting(id, 背景读取器)：
+    地址放超过 30 秒就丢掉快取地址 + 关掉背景读取器，回传 true 时把读取器变量设成 null，让作者重新取地址；
+    同时记下目前这一集，失败时只清这一集。"""
+    rcls = class_name(files[reader_path])
     hits = method_bodies(files, lambda p, x, m: "PlaybackPrepareException;-><init>" in m.group(5) and "static" not in m.group(1).split())
     ok = False
+    detail = f"：起播准备方法找到 {len(hits)} 个"
     if len(hits) == 1:
         path, m = hits[0]
         body = m.group(5)
-        nb, n = re.subn(r"(\n(\s*)iget-object (v\d+), p0, L[^;]+;->\w+:Ljava/lang/String;\n)", lambda mm: mm.group(1) + "\n" + mm.group(2) + "invoke-static/range {" + mm.group(3) + " .. " + mm.group(3) + "}, " + HOOKS + "->playStarting(Ljava/lang/String;)V\n", body, count=1)
+        rd = re.search(r"\n\s*iget-object (v\d+), p0, L[^;]+;->\w+:" + re.escape(rcls) + r"\n", body)
+        sid = re.search(r"\n(\s*)iget-object (v\d+), p0, L[^;]+;->\w+:Ljava/lang/String;\n", body)
+        loc = re.search(r"^\s*\.locals (\d+)", body, re.M)
+        detail = "：找不到读取器 / 集数 ID / .locals"
+        if rd and sid and loc and rd.start() < sid.start():
+            n = int(loc.group(1))
+            if n + 1 <= 15:
+                rv, ind, iv, nv = rd.group(1), sid.group(1), sid.group(2), "v" + str(n)
+                ins = (sid.group(0) + "\n" + ind + "invoke-static {" + iv + ", " + rv + "}, " + HOOKS + "->playStarting(Ljava/lang/String;Ljava/lang/Object;)Z\n"
+                       + "\n" + ind + "move-result " + nv + "\n"
+                       + "\n" + ind + "if-eqz " + nv + ", :hgtv_keep_reader\n"
+                       + "\n" + ind + "const/4 " + rv + ", 0x0\n"
+                       + "\n" + ind + ":hgtv_keep_reader\n")
+                nb = body[:sid.start()] + ins + body[sid.end():]
+                nb = re.sub(r"^(\s*)\.locals \d+", lambda mm: mm.group(1) + ".locals " + str(n + 1), nb, count=1, flags=re.M)
+                text = files[path]
+                text = text[:m.start(5)] + nb + text[m.end(5):]
+                path.write_text(text, encoding="utf-8"); files[path] = text
+                ok = True
+            else:
+                detail = "：暂存器不够"
+    report(ok, "起播前地址放超过 30 秒就换新的；失败时只清「这一集」的快取" + ("" if ok else detail))
+
+
+def auto_retry_forever(files):
+    """不用手动按重试：
+    1) 作者「已自动重试 3 次」的计数器每次检查前压回 2，永远不会走到「按确定键重试」画面；
+    2) 作者重取播放地址的上限 4 次 → 30 次。"""
+    ok1 = ok2 = False
+    hits = method_bodies(files, lambda p, x, m: "\\u5df2\\u81ea\\u52a8\\u91cd\\u8bd5 3 \\u6b21" in m.group(5))
+    if len(hits) == 1:
+        path, m = hits[0]
+        # 作者：iget-object vA, vS, F / iget-object vB, vS, F / iget vA, vA, Z->b:I —— vA 被覆盖，物件要用 vB
+        pat = re.compile(r"\n(\s*)iget-object (v\d+), (v\d+), (\S+)\n(\s*\n\s*)iget-object (v\d+), \3, \4\n(\s*\n\s*)iget \2, \2, (L[^;]+;->\w+:I)\n(\s*\n\s*const/4 v\d+, 0x0\n\s*\n\s*const/4 (v\d+), 0x3\n)")
+        found = pat.findall(m.group(5))
+        if len(found) == 1:
+            def rep(mm):
+                ind, ra, rs, f, s1, rb, s2, cnt, rest, c3 = mm.groups()
+                return ("\n" + ind + "iget-object " + ra + ", " + rs + ", " + f + "\n" + s1 + "iget-object " + rb + ", " + rs + ", " + f + "\n" + s2
+                        + "iget " + ra + ", " + ra + ", " + cnt + "\n"
+                        + "\n" + ind + "const/4 " + c3 + ", 0x2\n"
+                        + "\n" + ind + "if-le " + ra + ", " + c3 + ", :hgtv_retry_ok\n"
+                        + "\n" + ind + "iput " + c3 + ", " + rb + ", " + cnt + "\n"
+                        + "\n" + ind + "move " + ra + ", " + c3 + "\n"
+                        + "\n" + ind + ":hgtv_retry_ok\n" + rest)
+            nb = pat.sub(rep, m.group(5), count=1)
+            text = files[path]
+            text = text[:m.start(5)] + nb + text[m.end(5):]
+            path.write_text(text, encoding="utf-8"); files[path] = text
+            ok1 = True
+    hits = method_bodies(files, lambda p, x, m: "Transport dead" in m.group(5) and "\\u6309\\u786e\\u5b9a\\u952e\\u91cd\\u8bd5" in m.group(5))
+    if len(hits) == 1:
+        path, m = hits[0]
+        nb, n = re.subn(r"(\n\s*iput (v\d+), (v\d+), Lcom/hgtv/star/MainActivity;->\w+:I\n\s*\n\s*)const/4 (v\d+), 0x4(\n\s*\n\s*if-le \2, \4, :cond_\w+\n)", r"\1const/16 \4, 0x1e\5", m.group(5))
         if n == 1:
             text = files[path]
             text = text[:m.start(5)] + nb + text[m.end(5):]
             path.write_text(text, encoding="utf-8"); files[path] = text
-            ok = True
-    report(ok, "失败时只清「这一集」的快取（不动背景已准备好的下一集）" + ("" if ok else f"：起播准备方法找到 {len(hits)} 个"))
+            ok2 = True
+    report(ok1 and ok2, "自动重试不停（不用手动按重试；重取地址上限 4 → 30 次）" + ("" if ok1 and ok2 else f"：自动重试计数 {'✓' if ok1 else '✗'}、重取上限 {'✓' if ok2 else '✗'}"))
 
 
 def no_quality_down(files):
@@ -421,7 +490,8 @@ def main():
     tune_warm(files)
     limit_prepare(files, ranges[0][0])
     tune_pool(files)
-    hook_play_start(files)
+    hook_play_start(files, ranges[0][0])
+    auto_retry_forever(files)
     no_quality_down(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
