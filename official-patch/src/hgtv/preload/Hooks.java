@@ -104,6 +104,7 @@ public final class Hooks {
     public static Object streamBefore(Object repo, String id, int quality) {
         if (repo != null) repository = repo;   // 修补版：预载关着也要记下内容仓库（失败时清它快取的播放地址）
         if (id != null) { FETCHED_AT.put(id, System.currentTimeMillis()); if (FETCHED_AT.size() > 200) FETCHED_AT.clear(); }
+        if (!Boolean.TRUE.equals(REFETCHING.get())) LAST_CALL.set(new Object[]{repo, id, quality});
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
             STREAM_CALL.set(new Object[]{repo, id, quality, System.currentTimeMillis()});
@@ -122,7 +123,7 @@ public final class Hooks {
     }
 
     public static void streamAfter(Object result) {
-        try { if (result != null) rewriteBadNode(result, "取到新地址"); } catch (Throwable ignored) {}
+        if (result != null && !Boolean.TRUE.equals(REFETCHING.get())) refetchIfBad(result);
         if (!enabled || result == null || Boolean.TRUE.equals(INTERNAL.get())) return;
         try {
             Object[] call = STREAM_CALL.get();
@@ -781,6 +782,14 @@ public final class Hooks {
     /** 插在作者的播放失败上报（stage = playback_io / playback_prepare / playback_stall_buffer …）最前面。 */
     public static void onFailure(Throwable error, String stage) {
         try {
+            if (stage != null && stage.contains("prepare") && System.currentTimeMillis() - lastSkipAt < 3_000L) {
+                // 是我们自己跳过坏节点造成的「失败」：不是网络问题，不清 DNS、不算连续失败，只丢掉这集快取的地址让作者重取。
+                lastSkipAt = 0;
+                lastDrop = 0;
+                dropCachedStreams(curPlayId);
+                if (appCacheDir != null && curPlayId != null) deleteMatching(new File(appCacheDir, "playback-v1"), "url-", curPlayId);
+                return;
+            }
             FAILURES.incrementAndGet();
             String fid = curFid;
             Line line = LINES.get(fid);
@@ -974,6 +983,77 @@ public final class Hooks {
     // 11-02 实测：v26-reading-videocdn302 起播 9 次 0 成功（每次卡满 16 秒），其他节点 9 次 8 成功、多数 2 秒内。
 
     private static final long BAD_MS = 30 * 60_000L;
+    /** 方案 2（把坏节点网址换成同组好节点）：11-02 实测 CDN 回 403，网址签名绑主机名，关掉。 */
+    private static final boolean REWRITE_ON = false;
+    private static volatile long lastSkipAt;
+
+    // ───── 取到坏节点地址：当场重取（主 / 备轮流），拿到好节点才交给作者 ─────
+    private static final ThreadLocal<Object[]> LAST_CALL = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> REFETCHING = new ThreadLocal<>();
+    private static volatile Method fetchMethod;
+    private static final int REFETCH_MAX = 5;
+    private static final long REFETCH_BUDGET_MS = 8_000L;
+
+    /** 找出「取播放地址」的方法：就是正在呼叫 streamAfter 的那一个（从呼叫堆叠认，不靠混淆后的名字）。 */
+    private static Method fetchMethodOf(Object repo, Class<?> resultType) {
+        Method m = fetchMethod;
+        if (m != null) return m;
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        for (StackTraceElement e : st) {
+            if (!e.getClassName().equals(repo.getClass().getName())) continue;
+            for (Method c : allMethods(repo.getClass())) {
+                Class<?>[] p = c.getParameterTypes();
+                if (c.getName().equals(e.getMethodName()) && p.length == 2 && p[0] == String.class && p[1] == int.class
+                        && resultType.isAssignableFrom(c.getReturnType()) && !Modifier.isStatic(c.getModifiers())) {
+                    c.setAccessible(true); fetchMethod = c; return c;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void refetchIfBad(Object result) {
+        try {
+            String host = readerHost(result);
+            firstSeen(host);
+            if (!isBad(host)) return;
+            Object[] call = LAST_CALL.get();
+            if (call == null || call[0] == null || call[1] == null) return;
+            Method m = fetchMethodOf(call[0], result.getClass());
+            if (m == null) { ev("取到坏节点 " + host + " 的地址，但找不到取地址的方法，交给作者重取"); return; }
+            long start = System.currentTimeMillis();
+            StringBuilder tried = new StringBuilder(host.replace(".qznovelvod.com", ""));
+            REFETCHING.set(Boolean.TRUE);
+            try {
+                for (int i = 1; i <= REFETCH_MAX && System.currentTimeMillis() - start < REFETCH_BUDGET_MS; i++) {
+                    Object r;
+                    try { r = m.invoke(call[0], call[1], call[2]); }
+                    catch (Throwable e) { ev("当场重取地址失败：" + rootMessage(e)); return; }
+                    if (r == null) return;
+                    String h = readerHost(r);
+                    firstSeen(h);
+                    tried.append(" → ").append(h.replace(".qznovelvod.com", ""));
+                    if (!isBad(h)) {
+                        copyFields(r, result);
+                        ev("取到坏节点地址，当场重取 " + i + " 次换到好节点（" + tried + "，花 "
+                                + String.format(java.util.Locale.US, "%.1f", (System.currentTimeMillis() - start) / 1000.0) + " 秒）");
+                        return;
+                    }
+                }
+                ev("取到坏节点地址，当场重取 " + REFETCH_MAX + " 次都是坏节点（" + tried + "），交给作者重取");
+            } finally { REFETCHING.remove(); }
+        } catch (Throwable t) { log("refetchIfBad failed: " + rootMessage(t)); }
+    }
+
+    private static void copyFields(Object from, Object to) throws IllegalAccessException {
+        for (Class<?> c = to.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Field f : c.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                f.set(to, f.get(from));
+            }
+        }
+    }
     /** 节点健康：{连续失败次数, 最后成功时间, 坏到这个时间, 累计成功次数}；存在 files/hgtv-nodes.txt，重开 App 还记得。 */
     private static final Map<String, long[]> HEALTH = new ConcurrentHashMap<>();
     /** 同组（例如 -reading-videocdn302.qznovelvod.com）换节点失败过：到这个时间前不再换。 */
@@ -1154,6 +1234,7 @@ public final class Hooks {
 
     /** 如果 holder（串流资讯 / 读取器）里的网址连的是坏节点，就把主机名换成同组好节点。回传换成的主机名。 */
     static String rewriteBadNode(Object holder, String where) {
+        if (!REWRITE_ON) return null;
         try {
             String url = findUrl(holder, 0);
             if (url == null) return null;
@@ -1250,7 +1331,8 @@ public final class Hooks {
             curPrep = p;
             if (from == null && isBad(host)) {
                 p.watch = WATCH.schedule(() -> {
-                    if (!finishPrep(p, "跳过（坏节点，同组没有好节点可换），马上改重取地址", false)) return;
+                    if (!finishPrep(p, "跳过（坏节点），马上改重取地址", false)) return;
+                    lastSkipAt = System.currentTimeMillis();
                     try { if (reader instanceof Closeable) ((Closeable) reader).close(); } catch (Throwable ignored) {}
                 }, 50, java.util.concurrent.TimeUnit.MILLISECONDS);
                 return;
@@ -1366,7 +1448,7 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点自动换/跳过）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点当场重取/跳过）\n");
         b.append("★ ").append(summary()).append('\n');
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
