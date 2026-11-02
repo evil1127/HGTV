@@ -655,6 +655,8 @@ public final class Hooks {
                 try (java.io.FileOutputStream out = new java.io.FileOutputStream(df, false)) { out.write(keep.toString().getBytes("UTF-8")); } catch (Throwable ignored) {}
                 diagFile = df;
             }
+            nodesFile = new File(files, "hgtv-nodes.txt");
+            loadNodes();
             try { appVersion = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName; } catch (Throwable ignored) {}
             boolean dns = new File(cache, "dns-v1.txt").delete();
             // 作者把「播放地址（url-）、影片开头（head-）、索引（idx-）」都存在 playback-v1，重开 App 也照用。
@@ -837,6 +839,9 @@ public final class Hooks {
         if (id == null || id.isEmpty()) return false;
         curPlayId = id;
         try {
+            long now0 = System.currentTimeMillis();
+            Long st = SWITCH_START.get(id);
+            if (st == null || now0 - st > 10 * 60_000L) SWITCH_START.put(id, now0);
             Long t = FETCHED_AT.get(id);
             long age = t == null ? -1 : System.currentTimeMillis() - t;
             if (pooledReader != null) {
@@ -849,7 +854,10 @@ public final class Hooks {
                     return true;
                 }
             }
-            if (age < STALE_URL_MS) return false;
+            if (age < STALE_URL_MS) {
+                if (pooledReader != null) recordWait(id, true);
+                return false;
+            }
             lastDrop = 0;
             int dropped = dropCachedStreams(id);
             int files = appCacheDir == null ? 0 : deleteMatching(new File(appCacheDir, "playback-v1"), "url-", id);
@@ -950,14 +958,15 @@ public final class Hooks {
         if (curPrep == p) curPrep = null;
         nodeStat(p.host, ok, System.currentTimeMillis() - p.start);
         String via = p.rewrittenFrom == null ? "" : "（由坏节点 " + p.rewrittenFrom + " 换过来）";
-        ev((ok ? "起播成功" : "起播" + how) + "：节点 " + p.host + via + " 用时 " + p.secs() + " 秒");
+        String total = "";
+        if (ok) { long w = recordWait(curPlayId, false); if (w >= 0) total = String.format(java.util.Locale.US, "，这集共等 %.1f 秒", w / 1000.0); }
+        ev((ok ? "起播成功" : "起播" + how) + "：节点 " + p.host + via + " 用时 " + p.secs() + " 秒" + total);
         if (p.rewrittenFrom != null && !ok) {
             REWRITE_OFF.put(suffixOf(p.rewrittenFrom), System.currentTimeMillis() + BAD_MS);
             ev("换节点没成功：" + p.rewrittenFrom + " → " + p.host + "，30 分钟内这一组改成直接放弃坏节点");
         } else {
             health(p.host, ok);
         }
-        logIp(p.host);
         return true;
     }
 
@@ -965,7 +974,7 @@ public final class Hooks {
     // 11-02 实测：v26-reading-videocdn302 起播 9 次 0 成功（每次卡满 16 秒），其他节点 9 次 8 成功、多数 2 秒内。
 
     private static final long BAD_MS = 30 * 60_000L;
-    /** 节点健康：{连续失败次数, 最后成功时间, 坏到这个时间}。 */
+    /** 节点健康：{连续失败次数, 最后成功时间, 坏到这个时间, 累计成功次数}；存在 files/hgtv-nodes.txt，重开 App 还记得。 */
     private static final Map<String, long[]> HEALTH = new ConcurrentHashMap<>();
     /** 同组（例如 -reading-videocdn302.qznovelvod.com）换节点失败过：到这个时间前不再换。 */
     private static final Map<String, Long> REWRITE_OFF = new ConcurrentHashMap<>();
@@ -979,20 +988,129 @@ public final class Hooks {
         if (host == null || "?".equals(host)) return;
         long now = System.currentTimeMillis();
         long[] h = HEALTH.get(host);
-        if (h == null) { h = new long[3]; HEALTH.put(host, h); }
+        if (h == null) { h = new long[4]; HEALTH.put(host, h); }
         synchronized (h) {
             if (ok) {
                 if (h[2] > now) ev("节点 " + host + " 恢复正常");
-                h[0] = 0; h[1] = now; h[2] = 0;
-                return;
-            }
-            h[0]++;
-            boolean recentOk = h[1] > 0 && now - h[1] < BAD_MS;
-            if (h[0] >= 2 && !recentOk && h[2] <= now) {
-                h[2] = now + BAD_MS;
-                ev("认定坏节点：" + host + "（连续失败 " + h[0] + " 次、30 分钟内没成功过）→ 接下来 30 分钟避开它");
+                h[0] = 0; h[1] = now; h[2] = 0; h[3]++;
+            } else {
+                h[0]++;
+                boolean recentOk = h[1] > 0 && now - h[1] < BAD_MS;
+                int need = h[3] > 0 ? 3 : 2;   // 成功过的节点要连续失败 3 次才停用（减少误判），从没成功过的 2 次
+                if (h[0] >= need && !recentOk && h[2] <= now) {
+                    h[2] = now + BAD_MS;
+                    ev("认定坏节点：" + host + "（连续失败 " + h[0] + " 次、30 分钟内没成功过）→ 接下来 30 分钟避开它");
+                }
             }
         }
+        saveNodes();
+    }
+
+    private static long[] healthOf(String host) {
+        long[] h = HEALTH.get(host);
+        if (h == null) { h = new long[4]; HEALTH.put(host, h); }
+        return h;
+    }
+
+    /** 中国移动的 IP（39.128.0.0/10、2409:8000::/20）。11-02 实测台湾连过去起播几乎都卡死。 */
+    private static boolean chinaMobile(java.net.InetAddress a) {
+        byte[] b = a.getAddress();
+        if (b.length == 4) return (b[0] & 0xff) == 39 && (b[1] & 0xff) >= 128 && (b[1] & 0xff) < 192;
+        return b.length == 16 && (b[0] & 0xff) == 0x24 && (b[1] & 0xff) == 0x09 && (b[2] & 0xf0) == 0x80;
+    }
+
+    /** 节点第一次出现：记下 IP；全部是中国移动、又从没成功过 → 直接当坏节点（成功过一次就不再套这条）。 */
+    private static void firstSeen(String host) {
+        if (host == null || "?".equals(host) || !IP_LOGGED.add(host)) return;
+        try {
+            java.net.InetAddress[] all = java.net.InetAddress.getAllByName(host);
+            StringBuilder b = new StringBuilder();
+            boolean cm = all.length > 0;
+            for (java.net.InetAddress a : all) { if (b.length() > 0) b.append(", "); b.append(a.getHostAddress()); if (!chinaMobile(a)) cm = false; }
+            ev("节点 IP：" + host + " → " + b + (cm ? "（全是中国移动）" : ""));
+            if (cm) {
+                long[] h = healthOf(host);
+                synchronized (h) {
+                    if (h[3] == 0 && h[2] <= System.currentTimeMillis()) {
+                        h[2] = System.currentTimeMillis() + BAD_MS;
+                        ev("认定坏节点：" + host + "（全是中国移动 IP、从没成功过，台湾连过去很慢）→ 接下来 30 分钟避开它");
+                    }
+                }
+                saveNodes();
+            }
+        } catch (Throwable e) { ev("节点 IP：" + host + " → 解析失败 " + rootMessage(e)); }
+    }
+
+    // ───── 换集等待时间（诊断页最上面的摘要用） ─────
+    private static final Map<String, Long> SWITCH_START = new ConcurrentHashMap<>();
+    /** 最近 20 次换集：{等了几毫秒, 是否预载直接播(1/0)}。 */
+    private static final java.util.ArrayDeque<long[]> WAITS = new java.util.ArrayDeque<>();
+
+    static long recordWait(String id, boolean preload) {
+        Long st = id == null ? null : SWITCH_START.remove(id);
+        if (st == null) return -1;
+        long ms = Math.max(0, System.currentTimeMillis() - st);
+        synchronized (WAITS) { WAITS.addLast(new long[]{ms, preload ? 1 : 0}); while (WAITS.size() > 20) WAITS.removeFirst(); }
+        saveNodes();
+        return ms;
+    }
+
+    private static String summary() {
+        StringBuilder b = new StringBuilder();
+        synchronized (WAITS) {
+            if (WAITS.isEmpty()) b.append("最近换集：还没有纪录");
+            else {
+                long sum = 0, max = 0; int fast = 0, pre = 0;
+                for (long[] w : WAITS) { sum += w[0]; max = Math.max(max, w[0]); if (w[0] <= 5000) fast++; if (w[1] == 1) pre++; }
+                b.append(String.format(java.util.Locale.US, "最近 %d 次换集：平均等 %.1f 秒、最久 %.1f 秒、5 秒内 %d 次（预载直接播 %d 次）",
+                        WAITS.size(), sum / 1000.0 / WAITS.size(), max / 1000.0, fast, pre));
+            }
+        }
+        StringBuilder bad = new StringBuilder();
+        for (Map.Entry<String, long[]> e : HEALTH.entrySet()) if (isBad(e.getKey())) { if (bad.length() > 0) bad.append("、"); bad.append(e.getKey().replace(".qznovelvod.com", "")); }
+        b.append("；避开中的坏节点：").append(bad.length() == 0 ? "无" : bad.toString());
+        return b.toString();
+    }
+
+    // ───── 存档：files/hgtv-nodes.txt ─────
+    private static volatile File nodesFile;
+
+    private static void saveNodes() {
+        File f = nodesFile;
+        if (f == null) return;
+        try {
+            StringBuilder b = new StringBuilder();
+            long old = System.currentTimeMillis() - 7L * 24 * 3600_000L;
+            for (Map.Entry<String, long[]> e : HEALTH.entrySet()) {
+                long[] h = e.getValue();
+                if (h[1] < old && h[2] < System.currentTimeMillis() && h[3] == 0 && h[0] == 0) continue;
+                b.append("N\t").append(e.getKey()).append('\t').append(h[0]).append('\t').append(h[1]).append('\t').append(h[2]).append('\t').append(h[3]).append('\n');
+            }
+            synchronized (WAITS) { for (long[] w : WAITS) b.append("W\t").append(w[0]).append('\t').append(w[1]).append('\n'); }
+            synchronized (HEALTH) {
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(f, false)) { out.write(b.toString().getBytes("UTF-8")); }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void loadNodes() {
+        File f = nodesFile;
+        if (f == null || !f.exists()) return;
+        int n = 0, bad = 0;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"))) {
+            for (String l; (l = r.readLine()) != null; ) {
+                String[] s = l.split("\t");
+                try {
+                    if (s.length == 6 && "N".equals(s[0])) {
+                        HEALTH.put(s[1], new long[]{Long.parseLong(s[2]), Long.parseLong(s[3]), Long.parseLong(s[4]), Long.parseLong(s[5])});
+                        n++; if (isBad(s[1])) bad++;
+                    } else if (s.length == 3 && "W".equals(s[0])) {
+                        synchronized (WAITS) { WAITS.addLast(new long[]{Long.parseLong(s[1]), Long.parseLong(s[2])}); }
+                    }
+                } catch (NumberFormatException ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        if (n > 0) ev("读回节点纪录 " + n + " 个（其中避开中 " + bad + " 个）");
     }
 
     static boolean isBad(String host) {
@@ -1006,7 +1124,10 @@ public final class Hooks {
         return i < 0 ? host : host.substring(i);
     }
 
-    /** 同组里 30 分钟内成功过、现在不是坏节点、成功次数最多的那个。 */
+    /** 已知好用的同组节点（11-02 实测 0.1 秒起播），同组还没有成功纪录时拿来试。试失败一次就整组停用 30 分钟。 */
+    private static final String[] FALLBACK_PREFIX = {"v3", "v11"};
+
+    /** 同组里 3 天内成功过、现在不是坏节点、成功次数最多的；都没有就试备选清单。 */
     private static String goodSibling(String bad) {
         String suf = suffixOf(bad);
         Long off = REWRITE_OFF.get(suf);
@@ -1016,12 +1137,19 @@ public final class Hooks {
             String h = e.getKey();
             if (h.equals(bad) || !suffixOf(h).equals(suf) || isBad(h)) continue;
             long[] v = e.getValue();
-            if (v[1] == 0 || now - v[1] > BAD_MS) continue;
-            long okCount;
-            synchronized (NODE_STATS) { long[] s = NODE_STATS.get(h); okCount = s == null ? 0 : s[0]; }
-            if (best == null || okCount > bestOk) { best = h; bestOk = okCount; }
+            if (v[3] == 0 || now - v[1] > 3L * 24 * 3600_000L) continue;
+            if (best == null || v[3] > bestOk) { best = h; bestOk = v[3]; }
         }
-        return best;
+        if (best != null) return best;
+        if (!"-reading-videocdn302.qznovelvod.com".equals(suf)) return null;
+        for (String pre : FALLBACK_PREFIX) {
+            String h = pre + suf;
+            if (h.equals(bad) || isBad(h)) continue;
+            long[] v = HEALTH.get(h);
+            if (v != null && v[0] > 0 && v[3] == 0) continue;   // 试过、失败过、从没成功
+            return h;
+        }
+        return null;
     }
 
     /** 如果 holder（串流资讯 / 读取器）里的网址连的是坏节点，就把主机名换成同组好节点。回传换成的主机名。 */
@@ -1077,20 +1205,6 @@ public final class Hooks {
         return false;
     }
 
-    /** 每个节点第一次出现时记下它解析到的 IP（之后可以从 DNS 下手）。 */
-    private static void logIp(final String host) {
-        if (host == null || "?".equals(host) || !IP_LOGGED.add(host)) return;
-        Thread th = new Thread(() -> {
-            try {
-                StringBuilder b = new StringBuilder();
-                for (java.net.InetAddress a : java.net.InetAddress.getAllByName(host)) { if (b.length() > 0) b.append(", "); b.append(a.getHostAddress()); }
-                ev("节点 IP：" + host + " → " + b);
-            } catch (Throwable e) { ev("节点 IP：" + host + " → 解析失败 " + rootMessage(e)); }
-        }, "hgtv-ip");
-        th.setDaemon(true);
-        th.start();
-    }
-
     /** 从读取器身上找出影片网址的主机名（读取器 → 串流资讯 → http 网址，最多找两层）。 */
     static String readerHost(Object reader) {
         try {
@@ -1124,10 +1238,11 @@ public final class Hooks {
             Prep old = curPrep;
             if (old != null && old.reader != reader) finishPrep(old, "中断", false);
             String host = readerHost(reader);
+            firstSeen(host);
             String from = null;
             if (isBad(host)) {
                 String good = rewriteBadNode(reader, "起播前");
-                if (good != null) { from = host; host = good; }
+                if (good != null) { from = host; host = good; firstSeen(good); }
             } else {
                 try { String u = findUrl(reader, 0); if (u != null) from = REWRITTEN.get(u); } catch (Throwable ignored) {}
             }
@@ -1252,6 +1367,7 @@ public final class Hooks {
     private static String report() {
         StringBuilder b = new StringBuilder();
         b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点自动换/跳过）\n");
+        b.append("★ ").append(summary()).append('\n');
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
