@@ -663,6 +663,18 @@ public final class Hooks {
         } catch (Throwable t) { log("onAppStart failed: " + rootMessage(t)); }
     }
 
+    /** 删掉 dir 底下「以 prefix 开头、且档名含 key」的档案。 */
+    private static int deleteMatching(File dir, String prefix, String key) {
+        int n = 0;
+        File[] list = dir == null ? null : dir.listFiles();
+        if (list == null) return 0;
+        for (File f : list) {
+            if (f.isDirectory()) n += deleteMatching(f, prefix, key);
+            else if (f.getName().startsWith(prefix) && f.getName().contains(key) && f.delete()) n++;
+        }
+        return n;
+    }
+
     /** 删掉 dir 底下档名以 prefix 开头的档案（prefix 空字串 = 全部），回传删掉几个。 */
     private static int deleteAll(File dir, String prefix) {
         int n = 0;
@@ -772,20 +784,23 @@ public final class Hooks {
                     + " 线路=" + (line == null ? "?" : (line.usingBackup ? "备用 " : "主 ") + line.current()));
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
             if (line != null && line.current().contains(".")) clearHost(line.current(), stage);
-            int dropped = dropCachedStreams();
+            // 2. 记住哪条线路刚出事：主线路失败 → 接下来 10 分钟每集先用备用；备用失败 → 回到先用主线路。
+            if (line != null) {
+                boolean was = System.currentTimeMillis() < preferBackupUntil;
+                preferBackupUntil = line.usingBackup ? 0 : System.currentTimeMillis() + 10 * 60_000L;
+                boolean now = System.currentTimeMillis() < preferBackupUntil;
+                if (was != now) ev(now ? "主线路刚失败：接下来 10 分钟每集先用备用线路" : "备用线路也失败：改回先用主线路");
+            }
+            // 1. 只清「这一集」的快取地址 / 地址档，别的集（尤其背景已准备好的下一集）不动。
+            String id = curPlayId;
+            int dropped = dropCachedStreams(id);
             int files = 0;
-            long t0 = System.currentTimeMillis();
-            if (t0 - lastDiskDrop > 8_000L && appCacheDir != null) {
-                lastDiskDrop = t0;
+            if (appCacheDir != null && id != null && !id.isEmpty()) {
                 File pb = new File(appCacheDir, "playback-v1");
-                files = deleteAll(pb, "url-") + deleteAll(pb, "head-") + deleteAll(pb, "idx-");
+                files = deleteMatching(pb, "url-", id) + deleteTmp(pb);
             }
-            if (dropped + files > 0) ev("丢掉快取的播放地址 " + dropped + " 个、播放暂存档 " + files + " 个（重载时重新取，可轮到备用线路）");
+            if (dropped + files > 0) ev("只丢掉这一集（" + (id == null ? "?" : id) + "）的快取地址 " + dropped + " 个、地址档 " + files + " 个，其他集保留");
             else if (repository == null) ev("（还没认出内容仓库，记忆体里的播放地址没清到）");
-            if (stage.contains("prepare")) {
-                long now = System.currentTimeMillis();
-                if (now - lastTmpClean > 60_000L) { lastTmpClean = now; int n = deleteTmp(appCacheDir == null ? null : new File(appCacheDir, "playback-v1")); if (n > 0) ev("清未完成暂存 " + n + " 个"); }
-            }
             List<Long> times = FAILS.get(fid);
             if (times == null) { times = new ArrayList<>(); FAILS.put(fid, times); }
             long now = System.currentTimeMillis();
@@ -798,6 +813,15 @@ public final class Hooks {
     }
 
     private static volatile long lastDrop;
+    /** 正在起播的那一集 ID（作者「起播准备」读到的那一个，不含背景暖机）。 */
+    private static volatile String curPlayId;
+    /** 这个时间之前，每集第一次取地址先用备用线路。 */
+    private static volatile long preferBackupUntil;
+
+    /** 插在作者「起播准备」最前面（拿到这次要播的集数 ID 之后）。 */
+    public static void playStarting(String id) {
+        if (id != null && !id.isEmpty()) curPlayId = id;
+    }
     private static volatile long lastDiskDrop;
 
     /** 插在作者「取播放地址 / 读快取地址」的方法最前面：记下内容仓库，失败时才清得到它快取的地址。 */
@@ -809,12 +833,13 @@ public final class Hooks {
      * 作者把取到的播放地址快取在内容仓库里（失效前一直重用）。缓冲卡住时作者只清连线池、用同一个地址重载，
      * 同一个坏节点就会一直卡在同一秒。这里把快取里的播放地址丢掉，逼重载时重新取（会经过 pickLine 轮替线路）。
      */
-    static int dropCachedStreams() {
+    static int dropCachedStreams(String id) {
         long now = System.currentTimeMillis();
-        if (now - lastDrop < 8_000L) return 0;
+        if (now - lastDrop < 3_000L) return 0;
         lastDrop = now;
         Object repo = repository;
-        if (repo == null) return 0;
+        if (repo == null || id == null || id.isEmpty()) return 0;
+        String prefix = id + ":";
         int n = 0;
         try {
             for (Field f : allFields(repo.getClass())) {
@@ -822,8 +847,10 @@ public final class Hooks {
                 f.setAccessible(true);
                 Object m = f.get(repo);
                 if (!(m instanceof Map)) continue;
-                for (Iterator<?> it = ((Map<?, ?>) m).values().iterator(); it.hasNext(); ) {
-                    Object v = it.next();
+                for (Iterator<? extends Map.Entry<?, ?>> it = ((Map<?, ?>) m).entrySet().iterator(); it.hasNext(); ) {
+                    Map.Entry<?, ?> en = it.next();
+                    Object k = en.getKey(), v = en.getValue();
+                    if (!(k instanceof String) || !(((String) k).equals(id) || ((String) k).startsWith(prefix))) continue;
                     if (v != null && holdsStream(v.getClass())) { it.remove(); n++; }
                 }
             }
@@ -906,12 +933,13 @@ public final class Hooks {
             l.mainHost = main.isEmpty() ? "-" : (plainUrl(main).isEmpty() ? "(加密)" : hostOf(plainUrl(main)));
             l.backupHost = backupRaw.isEmpty() ? "-" : (backup.isEmpty() ? "(加密)" : hostOf(backup));
             curFid = fid;
-            boolean wantBackup = l.fetches % 2 == 0 && !backupRaw.isEmpty() && !backupRaw.equals(main);
+            boolean preferBackup = now < preferBackupUntil;
+            boolean wantBackup = ((l.fetches % 2 == 0) != preferBackup) && !backupRaw.isEmpty() && !backupRaw.equals(main);
             if (wantBackup) {
                 o.put("main_url", backupRaw);
                 l.usingBackup = true;
                 LINE_SWITCHES.incrementAndGet();
-                ev("线路 第" + l.fetches + "次取地址 → 备用 " + l.backupHost + "（主 " + l.mainHost + "）");
+                ev("线路 第" + l.fetches + "次取地址 → 备用 " + l.backupHost + (preferBackup && l.fetches == 1 ? "（主线路最近失败过，先用备用）" : "（主 " + l.mainHost + "）"));
             } else {
                 l.usingBackup = false;
                 if (l.fetches > 1) ev("线路 第" + l.fetches + "次取地址 → 主 " + l.mainHost);
@@ -968,7 +996,8 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理、主备轮替、闲置连线15秒；起播限时已关）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮替+记住好线路、闲置连线15秒、不自动降画质；起播限时已关）\n");
+        b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
         b.append("清 DNS ").append(DNS_CLEARS.get()).append(" 次 / 换备用线路 ").append(LINE_SWITCHES.get()).append(" 次 / 播放失败 ").append(FAILURES.get()).append(" 次\n");
