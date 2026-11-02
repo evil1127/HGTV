@@ -122,6 +122,7 @@ public final class Hooks {
     }
 
     public static void streamAfter(Object result) {
+        try { if (result != null) rewriteBadNode(result, "取到新地址"); } catch (Throwable ignored) {}
         if (!enabled || result == null || Boolean.TRUE.equals(INTERNAL.get())) return;
         try {
             Object[] call = STREAM_CALL.get();
@@ -838,6 +839,16 @@ public final class Hooks {
         try {
             Long t = FETCHED_AT.get(id);
             long age = t == null ? -1 : System.currentTimeMillis() - t;
+            if (pooledReader != null) {
+                String ph = readerHost(pooledReader);
+                if (isBad(ph) && !hasBytes(pooledReader)) {
+                    if (pooledReader instanceof Closeable) try { ((Closeable) pooledReader).close(); } catch (Throwable ignored) {}
+                    lastDrop = 0;
+                    int dropped = dropCachedStreams(id);
+                    ev("背景准备的读取器连的是坏节点 " + ph + "，丢掉重取（快取地址 " + dropped + " 个）");
+                    return true;
+                }
+            }
             if (age < STALE_URL_MS) return false;
             lastDrop = 0;
             int dropped = dropCachedStreams(id);
@@ -913,9 +924,9 @@ public final class Hooks {
 
     /** 一次前景起播准备：哪个读取器、几点开始、连到哪个 CDN 节点。 */
     private static final class Prep {
-        final Object reader; final long start = System.currentTimeMillis(); final String host;
+        final Object reader; final long start = System.currentTimeMillis(); final String host; final String rewrittenFrom;
         volatile java.util.concurrent.ScheduledFuture<?> watch; volatile boolean done;
-        Prep(Object reader, String host) { this.reader = reader; this.host = host; }
+        Prep(Object reader, String host, String rewrittenFrom) { this.reader = reader; this.host = host; this.rewrittenFrom = rewrittenFrom; }
         String secs() { return String.format(java.util.Locale.US, "%.1f", (System.currentTimeMillis() - start) / 1000.0); }
     }
     private static volatile Prep curPrep;
@@ -938,8 +949,146 @@ public final class Hooks {
         if (f != null) f.cancel(false);
         if (curPrep == p) curPrep = null;
         nodeStat(p.host, ok, System.currentTimeMillis() - p.start);
-        ev((ok ? "起播成功" : "起播" + how) + "：节点 " + p.host + " 用时 " + p.secs() + " 秒");
+        String via = p.rewrittenFrom == null ? "" : "（由坏节点 " + p.rewrittenFrom + " 换过来）";
+        ev((ok ? "起播成功" : "起播" + how) + "：节点 " + p.host + via + " 用时 " + p.secs() + " 秒");
+        if (p.rewrittenFrom != null && !ok) {
+            REWRITE_OFF.put(suffixOf(p.rewrittenFrom), System.currentTimeMillis() + BAD_MS);
+            ev("换节点没成功：" + p.rewrittenFrom + " → " + p.host + "，30 分钟内这一组改成直接放弃坏节点");
+        } else {
+            health(p.host, ok);
+        }
+        logIp(p.host);
         return true;
+    }
+
+    // ───────────── 7. 坏节点：自动认出、换成同组好节点，换不了就马上放弃 ─────────────
+    // 11-02 实测：v26-reading-videocdn302 起播 9 次 0 成功（每次卡满 16 秒），其他节点 9 次 8 成功、多数 2 秒内。
+
+    private static final long BAD_MS = 30 * 60_000L;
+    /** 节点健康：{连续失败次数, 最后成功时间, 坏到这个时间}。 */
+    private static final Map<String, long[]> HEALTH = new ConcurrentHashMap<>();
+    /** 同组（例如 -reading-videocdn302.qznovelvod.com）换节点失败过：到这个时间前不再换。 */
+    private static final Map<String, Long> REWRITE_OFF = new ConcurrentHashMap<>();
+    /** 换过的网址 → 原本的坏节点。 */
+    private static final Map<String, String> REWRITTEN = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<String, String>() {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, String> e) { return size() > 100; }
+    });
+    private static final java.util.Set<String> IP_LOGGED = java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    private static void health(String host, boolean ok) {
+        if (host == null || "?".equals(host)) return;
+        long now = System.currentTimeMillis();
+        long[] h = HEALTH.get(host);
+        if (h == null) { h = new long[3]; HEALTH.put(host, h); }
+        synchronized (h) {
+            if (ok) {
+                if (h[2] > now) ev("节点 " + host + " 恢复正常");
+                h[0] = 0; h[1] = now; h[2] = 0;
+                return;
+            }
+            h[0]++;
+            boolean recentOk = h[1] > 0 && now - h[1] < BAD_MS;
+            if (h[0] >= 2 && !recentOk && h[2] <= now) {
+                h[2] = now + BAD_MS;
+                ev("认定坏节点：" + host + "（连续失败 " + h[0] + " 次、30 分钟内没成功过）→ 接下来 30 分钟避开它");
+            }
+        }
+    }
+
+    static boolean isBad(String host) {
+        long[] h = host == null ? null : HEALTH.get(host);
+        return h != null && h[2] > System.currentTimeMillis();
+    }
+
+    /** vN-reading-videocdn302.qznovelvod.com → -reading-videocdn302.qznovelvod.com（同一组节点）。 */
+    private static String suffixOf(String host) {
+        int i = host.indexOf('-');
+        return i < 0 ? host : host.substring(i);
+    }
+
+    /** 同组里 30 分钟内成功过、现在不是坏节点、成功次数最多的那个。 */
+    private static String goodSibling(String bad) {
+        String suf = suffixOf(bad);
+        Long off = REWRITE_OFF.get(suf);
+        if (off != null && off > System.currentTimeMillis()) return null;
+        String best = null; long bestOk = 0; long now = System.currentTimeMillis();
+        for (Map.Entry<String, long[]> e : HEALTH.entrySet()) {
+            String h = e.getKey();
+            if (h.equals(bad) || !suffixOf(h).equals(suf) || isBad(h)) continue;
+            long[] v = e.getValue();
+            if (v[1] == 0 || now - v[1] > BAD_MS) continue;
+            long okCount;
+            synchronized (NODE_STATS) { long[] s = NODE_STATS.get(h); okCount = s == null ? 0 : s[0]; }
+            if (best == null || okCount > bestOk) { best = h; bestOk = okCount; }
+        }
+        return best;
+    }
+
+    /** 如果 holder（串流资讯 / 读取器）里的网址连的是坏节点，就把主机名换成同组好节点。回传换成的主机名。 */
+    static String rewriteBadNode(Object holder, String where) {
+        try {
+            String url = findUrl(holder, 0);
+            if (url == null) return null;
+            String host = new java.net.URI(url).getHost();
+            if (host == null || !isBad(host)) return null;
+            String good = goodSibling(host);
+            if (good == null) return null;
+            int i = url.indexOf(host);
+            String nu = url.substring(0, i) + good + url.substring(i + host.length());
+            if (replaceUrl(holder, url, nu, 0)) {
+                REWRITTEN.put(nu, host);
+                ev("换节点（" + where + "）：" + host + " → " + good);
+                return good;
+            }
+        } catch (Throwable t) { log("rewriteBadNode failed: " + rootMessage(t)); }
+        return null;
+    }
+
+    private static boolean replaceUrl(Object o, String old, String nu, int depth) throws IllegalAccessException {
+        if (o == null || depth > 2) return false;
+        boolean done = false;
+        for (Field f : allFields(o.getClass())) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+            f.setAccessible(true);
+            Object v = f.get(o);
+            if (v instanceof String && old.equals(v)) { f.set(o, nu); done = true; }
+        }
+        if (done) return true;
+        for (Field f : allFields(o.getClass())) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+            String cn = f.getType().getName();
+            if (cn.startsWith("java.") || cn.startsWith("android.") || f.getType().isArray()) continue;
+            f.setAccessible(true);
+            if (replaceUrl(f.get(o), old, nu, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    /** 读取器身上有没有已经抓好的资料（byte[] 不是空的）＝ 已经准备好了。 */
+    private static boolean hasBytes(Object reader) {
+        try {
+            for (Field f : allFields(reader.getClass())) {
+                if (f.getType() != byte[].class || java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                Object v = f.get(reader);
+                if (v instanceof byte[] && ((byte[]) v).length > 0) return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    /** 每个节点第一次出现时记下它解析到的 IP（之后可以从 DNS 下手）。 */
+    private static void logIp(final String host) {
+        if (host == null || "?".equals(host) || !IP_LOGGED.add(host)) return;
+        Thread th = new Thread(() -> {
+            try {
+                StringBuilder b = new StringBuilder();
+                for (java.net.InetAddress a : java.net.InetAddress.getAllByName(host)) { if (b.length() > 0) b.append(", "); b.append(a.getHostAddress()); }
+                ev("节点 IP：" + host + " → " + b);
+            } catch (Throwable e) { ev("节点 IP：" + host + " → 解析失败 " + rootMessage(e)); }
+        }, "hgtv-ip");
+        th.setDaemon(true);
+        th.start();
     }
 
     /** 从读取器身上找出影片网址的主机名（读取器 → 串流资讯 → http 网址，最多找两层）。 */
@@ -974,8 +1123,23 @@ public final class Hooks {
         try {
             Prep old = curPrep;
             if (old != null && old.reader != reader) finishPrep(old, "中断", false);
-            final Prep p = new Prep(reader, readerHost(reader));
+            String host = readerHost(reader);
+            String from = null;
+            if (isBad(host)) {
+                String good = rewriteBadNode(reader, "起播前");
+                if (good != null) { from = host; host = good; }
+            } else {
+                try { String u = findUrl(reader, 0); if (u != null) from = REWRITTEN.get(u); } catch (Throwable ignored) {}
+            }
+            final Prep p = new Prep(reader, host, from);
             curPrep = p;
+            if (from == null && isBad(host)) {
+                p.watch = WATCH.schedule(() -> {
+                    if (!finishPrep(p, "跳过（坏节点，同组没有好节点可换），马上改重取地址", false)) return;
+                    try { if (reader instanceof Closeable) ((Closeable) reader).close(); } catch (Throwable ignored) {}
+                }, 50, java.util.concurrent.TimeUnit.MILLISECONDS);
+                return;
+            }
             p.watch = WATCH.schedule(() -> {
                 if (!finishPrep(p, "超过 " + PREPARE_LIMIT_MS / 1000 + " 秒，提早放弃、改重取地址", false)) return;
                 try { if (reader instanceof Closeable) ((Closeable) reader).close(); } catch (Throwable ignored) {}
@@ -1087,7 +1251,7 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点自动换/跳过）\n");
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
@@ -1101,7 +1265,7 @@ public final class Hooks {
                 long[] s = e.getValue();
                 b.append(e.getKey()).append("  成功 ").append(s[0]);
                 if (s[0] > 0) b.append(String.format(java.util.Locale.US, "（平均 %.1f 秒、最慢 %.1f 秒）", s[2] / 1000.0 / s[0], s[3] / 1000.0));
-                b.append("  失败 ").append(s[1]).append('\n');
+                b.append("  失败 ").append(s[1]).append(isBad(e.getKey()) ? "  【坏节点，避开中】" : "").append('\n');
             }
         }
         b.append("\n===== 修补事件（最近 ").append(EVENT_MAX).append(" 条，含之前启动的） =====\n");
