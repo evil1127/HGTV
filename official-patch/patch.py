@@ -394,6 +394,32 @@ def auto_retry_forever(files):
     report(ok1 and ok2, "自动重试不停（不用手动按重试；每次等 2 秒；重取地址上限 4 → 30 次）" + ("" if ok1 and ok2 else f"：自动重试计数 {'✓' if ok1 else '✗'}、重取上限 {'✓' if ok2 else '✗'}"))
 
 
+
+def hook_seamless(files, reader_path):
+    """诊断用：作者「预载好的下一集直接接上播」那一处（下一集读取器 → 目前读取器 → 上一个读取器 连续搬移）挂 Hooks.seamlessSwitch，
+    诊断页摘要才算得到「预载直接播」的换集。"""
+    rcls = class_name(files[reader_path])
+    pair = re.compile(r"\n(\s*)iget-object (v\d+), (v\d+), (L[^;]+;)->(\w+):" + re.escape(rcls) + r"\n\s*\n\s*iput-object \2, \3, \4->(\w+):" + re.escape(rcls) + r"\n")
+    hits = []
+    for path, text in files.items():
+        for m in METHOD_RE.finditer(text):
+            body = m.group(5)
+            ps = list(pair.finditer(body))
+            if len(ps) < 2: continue
+            srcs = {x.group(5) for x in ps}
+            for x in ps:
+                if x.group(6) in srcs and x.group(6) != x.group(5):
+                    hits.append((path, m, x))
+    ok = len(hits) == 1
+    if ok:
+        path, m, x = hits[0]
+        body = m.group(5)
+        nb = body[:x.end()] + "\n" + x.group(1) + "invoke-static {}, " + HOOKS + "->seamlessSwitch()V\n" + body[x.end():]
+        text = files[path]
+        text = text[:m.start(5)] + nb + text[m.end(5):]
+        path.write_text(text, encoding="utf-8"); files[path] = text
+    report(ok, "诊断：算得到「预载直接播」的换集" + ("" if ok else f"：找到 {len(hits)} 处"))
+
 def no_quality_down(files):
     """不自动降画质：作者的「降档」预算（QUALITY_DOWN，原本 2 次）改成 0 次；同画质重建（SAME_QUALITY_REBUILD）照旧。"""
     enum = [p for p, x in files.items() if '"QUALITY_DOWN"' in x and '"SAME_QUALITY_REBUILD"' in x]
@@ -495,6 +521,7 @@ def main():
     tune_pool(files)
     hook_play_start(files, ranges[0][0])
     auto_retry_forever(files)
+    hook_seamless(files, ranges[0][0])
     no_quality_down(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
