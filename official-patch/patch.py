@@ -272,7 +272,7 @@ def tune_warm(files):
     report(ok, "下一集提早暖机（剩 75 秒开始，失败每 4 秒重试、最多 7 次）" + ("" if ok else "：找不到作者的暖机条件"))
 
 def limit_prepare(files, reader_path):
-    """前景起播限 12 秒：只在「起播准备」方法（会丢 PlaybackPrepareException 的那个）呼叫读取器 prepare 的地方前后挂
+    """前景起播限 16 秒：只在「起播准备」方法（会丢 PlaybackPrepareException 的那个）呼叫读取器 prepare 的地方前后挂
     Hooks.prepareBegin / prepareEnd。背景暖机（同一个读取器 prepare 方法被别处呼叫）不受限制。"""
     rcls = class_name(files[reader_path])
     hits = [m for m in METHOD_RE.finditer(files[reader_path]) if "static" not in m.group(1).split() and m.group(3) == "" and m.group(4) == "V" and '"prepared"' in m.group(5)]
@@ -298,7 +298,7 @@ def limit_prepare(files, reader_path):
                 text = text[:m.start(5)] + nb + text[m.end(5):]
                 path.write_text(text, encoding="utf-8"); files[path] = text
                 ok = True
-    report(ok, "前景起播限 12 秒（背景暖机不限）" + ("" if ok else detail))
+    report(ok, "前景起播限 16 秒（背景暖机不限）" + ("" if ok else detail))
 
 def tune_pool(files):
     """闲置连线只留 15 秒（OkHttp 默认 5 分钟）。
@@ -320,7 +320,7 @@ def tune_pool(files):
 
 def hook_play_start(files, reader_path):
     """起播准备一拿到集数 ID 就呼叫 Hooks.playStarting(id, 背景读取器)：
-    地址放超过 30 秒就丢掉快取地址 + 关掉背景读取器，回传 true 时把读取器变量设成 null，让作者重新取地址；
+    地址放超过 5 分钟就丢掉快取地址 + 关掉背景读取器，回传 true 时把读取器变量设成 null，让作者重新取地址；
     同时记下目前这一集，失败时只清这一集。"""
     rcls = class_name(files[reader_path])
     hits = method_bodies(files, lambda p, x, m: "PlaybackPrepareException;-><init>" in m.group(5) and "static" not in m.group(1).split())
@@ -350,13 +350,14 @@ def hook_play_start(files, reader_path):
                 ok = True
             else:
                 detail = "：暂存器不够"
-    report(ok, "起播前地址放超过 30 秒就换新的；失败时只清「这一集」的快取" + ("" if ok else detail))
+    report(ok, "起播前地址放超过 5 分钟才换新的；失败时只清「这一集」的快取" + ("" if ok else detail))
 
 
 def auto_retry_forever(files):
     """不用手动按重试：
     1) 作者「已自动重试 3 次」的计数器每次检查前压回 2，永远不会走到「按确定键重试」画面；
-    2) 作者重取播放地址的上限 4 次 → 30 次。"""
+    2) 作者重取播放地址的上限 4 次 → 30 次；
+    3) 自动重试的等待 3 / 6 / 12 秒 → 一律 2 秒（计数压在 2 之后原本会每次都等 12 秒）。"""
     ok1 = ok2 = False
     hits = method_bodies(files, lambda p, x, m: "\\u5df2\\u81ea\\u52a8\\u91cd\\u8bd5 3 \\u6b21" in m.group(5))
     if len(hits) == 1:
@@ -375,10 +376,12 @@ def auto_retry_forever(files):
                         + "\n" + ind + "move " + ra + ", " + c3 + "\n"
                         + "\n" + ind + ":hgtv_retry_ok\n" + rest)
             nb = pat.sub(rep, m.group(5), count=1)
-            text = files[path]
-            text = text[:m.start(5)] + nb + text[m.end(5):]
-            path.write_text(text, encoding="utf-8"); files[path] = text
-            ok1 = True
+            nb, nd = re.subn(r"(const-wide/16 v\d+, )0x(bb8|1770|2ee0)\n", r"\g<1>0x7d0\n", nb)
+            if nd == 3:
+                text = files[path]
+                text = text[:m.start(5)] + nb + text[m.end(5):]
+                path.write_text(text, encoding="utf-8"); files[path] = text
+                ok1 = True
     hits = method_bodies(files, lambda p, x, m: "Transport dead" in m.group(5) and "\\u6309\\u786e\\u5b9a\\u952e\\u91cd\\u8bd5" in m.group(5))
     if len(hits) == 1:
         path, m = hits[0]
@@ -388,7 +391,7 @@ def auto_retry_forever(files):
             text = text[:m.start(5)] + nb + text[m.end(5):]
             path.write_text(text, encoding="utf-8"); files[path] = text
             ok2 = True
-    report(ok1 and ok2, "自动重试不停（不用手动按重试；重取地址上限 4 → 30 次）" + ("" if ok1 and ok2 else f"：自动重试计数 {'✓' if ok1 else '✗'}、重取上限 {'✓' if ok2 else '✗'}"))
+    report(ok1 and ok2, "自动重试不停（不用手动按重试；每次等 2 秒；重取地址上限 4 → 30 次）" + ("" if ok1 and ok2 else f"：自动重试计数 {'✓' if ok1 else '✗'}、重取上限 {'✓' if ok2 else '✗'}"))
 
 
 def no_quality_down(files):
