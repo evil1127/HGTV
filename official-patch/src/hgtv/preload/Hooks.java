@@ -783,6 +783,7 @@ public final class Hooks {
             Line line = LINES.get(fid);
             ev("播放失败 stage=" + stage + " err=" + (error == null ? "-" : rootMessage(error))
                     + " 线路=" + (line == null ? "?" : (line.usingBackup ? "备用 " : "主 ") + line.current()));
+            if (stage != null && stage.contains("prepare")) prepareFailed(error);
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
             if (line != null && line.current().contains(".")) clearHost(line.current(), stage);
             // 2. 记住哪条线路刚出事：主线路失败 → 接下来 10 分钟每集先用备用；备用失败 → 回到先用主线路。
@@ -823,7 +824,8 @@ public final class Hooks {
     /** 每一集最后一次向平台取到播放地址的时间（不论是起播还是背景暖机）。 */
     private static final Map<String, Long> FETCHED_AT = new ConcurrentHashMap<>();
     /** 预先取好的地址放超过这么久才要起播，就先换一个新的。 */
-    private static final long STALE_URL_MS = 30_000L;
+    // 11-02 实测：30 秒会把每一集背景暖机的地址都丢掉（暖机都在 44~48 秒前），而且新地址一样会卡 → 放宽到 5 分钟，只防真的过期。
+    private static final long STALE_URL_MS = 300_000L;
 
     /**
      * 插在作者「起播准备」最前面（拿到这次要播的集数 ID 与「背景准备好的读取器」之后）。
@@ -892,16 +894,15 @@ public final class Hooks {
 
     // ───────────── 6. 起播准备限时 ─────────────
     // 起播前作者会先抓影片开头（约 2 MB）。这一步原本跟一般下载共用 25 秒总时限，卡死时要等满 25 秒才放弃。
-    // 只给这一步 10 秒：超过就关掉这个读取器，作者会当成失败、重取地址（轮替线路）再来。一般播放中的下载不受影响。
+    // 只给前景起播 16 秒：超过就关掉这个读取器，作者会当成失败、重取地址（轮替线路）再来。一般播放中的下载不受影响。
 
-    private static final long PREPARE_LIMIT_MS = 12_000L;
+    // 11-02 实测成功的起播用了 1~10 秒，12 秒太紧 → 16 秒。
+    private static final long PREPARE_LIMIT_MS = 16_000L;
     private static final java.util.concurrent.ScheduledExecutorService WATCH = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "hgtv-prepare-watch");
         t.setDaemon(true);
         return t;
     });
-    private static final Map<Object, java.util.concurrent.ScheduledFuture<?>> PREPARING =
-            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Object, java.util.concurrent.ScheduledFuture<?>>());
 
     /** 插在作者「起播准备」方法最前面。 */
     /**
@@ -910,25 +911,90 @@ public final class Hooks {
      */
     private static final boolean PREPARE_LIMIT_ON = true;
 
+    /** 一次前景起播准备：哪个读取器、几点开始、连到哪个 CDN 节点。 */
+    private static final class Prep {
+        final Object reader; final long start = System.currentTimeMillis(); final String host;
+        volatile java.util.concurrent.ScheduledFuture<?> watch; volatile boolean done;
+        Prep(Object reader, String host) { this.reader = reader; this.host = host; }
+        String secs() { return String.format(java.util.Locale.US, "%.1f", (System.currentTimeMillis() - start) / 1000.0); }
+    }
+    private static volatile Prep curPrep;
+    /** 每个 CDN 节点：{成功次数, 失败次数, 成功总毫秒, 成功最慢毫秒}（这次启动以来）。 */
+    private static final Map<String, long[]> NODE_STATS = new java.util.TreeMap<>();
+
+    private static void nodeStat(String host, boolean ok, long ms) {
+        synchronized (NODE_STATS) {
+            long[] s = NODE_STATS.get(host);
+            if (s == null) { s = new long[4]; NODE_STATS.put(host, s); }
+            if (ok) { s[0]++; s[2] += ms; if (ms > s[3]) s[3] = ms; } else s[1]++;
+        }
+    }
+
+    /** 结束一次起播准备（成功 / 逾时 / 其他失败），记事件 + 节点统计。只会结算一次。 */
+    private static boolean finishPrep(Prep p, String how, boolean ok) {
+        if (p == null) return false;
+        synchronized (p) { if (p.done) return false; p.done = true; }
+        java.util.concurrent.ScheduledFuture<?> f = p.watch;
+        if (f != null) f.cancel(false);
+        if (curPrep == p) curPrep = null;
+        nodeStat(p.host, ok, System.currentTimeMillis() - p.start);
+        ev((ok ? "起播成功" : "起播" + how) + "：节点 " + p.host + " 用时 " + p.secs() + " 秒");
+        return true;
+    }
+
+    /** 从读取器身上找出影片网址的主机名（读取器 → 串流资讯 → http 网址，最多找两层）。 */
+    static String readerHost(Object reader) {
+        try {
+            String u = findUrl(reader, 0);
+            if (u != null) { String h = new java.net.URI(u).getHost(); if (h != null) return h; }
+        } catch (Throwable ignored) {}
+        return "?";
+    }
+    private static String findUrl(Object o, int depth) throws IllegalAccessException {
+        if (o == null || depth > 2) return null;
+        for (Field f : allFields(o.getClass())) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+            f.setAccessible(true);
+            Object v = f.get(o);
+            if (v instanceof String) { String s = (String) v; if (s.startsWith("http")) return s; }
+        }
+        for (Field f : allFields(o.getClass())) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+            String cn = f.getType().getName();
+            if (cn.startsWith("java.") || cn.startsWith("android.") || f.getType().isArray()) continue;
+            f.setAccessible(true);
+            String u = findUrl(f.get(o), depth + 1);
+            if (u != null) return u;
+        }
+        return null;
+    }
+
     public static void prepareBegin(final Object reader) {
         if (!PREPARE_LIMIT_ON || reader == null) return;
         try {
-            java.util.concurrent.ScheduledFuture<?> f = WATCH.schedule(() -> {
-                if (PREPARING.remove(reader) == null) return;
-                ev("起播准备超过 " + PREPARE_LIMIT_MS / 1000 + " 秒，提早放弃，改重取地址");
+            Prep old = curPrep;
+            if (old != null && old.reader != reader) finishPrep(old, "中断", false);
+            final Prep p = new Prep(reader, readerHost(reader));
+            curPrep = p;
+            p.watch = WATCH.schedule(() -> {
+                if (!finishPrep(p, "超过 " + PREPARE_LIMIT_MS / 1000 + " 秒，提早放弃、改重取地址", false)) return;
                 try { if (reader instanceof Closeable) ((Closeable) reader).close(); } catch (Throwable ignored) {}
             }, PREPARE_LIMIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
-            java.util.concurrent.ScheduledFuture<?> old = PREPARING.put(reader, f);
-            if (old != null) old.cancel(false);
         } catch (Throwable t) { log("prepareBegin failed: " + rootMessage(t)); }
     }
 
-    /** 插在「起播准备」每个正常结束的 return 前面。 */
+    /** 插在前景呼叫读取器准备之后（正常完成才会走到）。 */
     public static void prepareEnd(Object reader) {
         try {
-            java.util.concurrent.ScheduledFuture<?> f = PREPARING.remove(reader);
-            if (f != null) f.cancel(false);
+            Prep p = curPrep;
+            if (p != null && p.reader == reader) finishPrep(p, "", true);
         } catch (Throwable ignored) {}
+    }
+
+    /** onFailure 用：起播准备失败（不是逾时）时结算。 */
+    static void prepareFailed(Throwable error) {
+        Prep p = curPrep;
+        if (p != null) finishPrep(p, "失败（" + (error == null ? "-" : rootMessage(error)) + "）", false);
     }
 
     // ───────────── 4. 主 / 备线路轮替 ─────────────
@@ -1021,13 +1087,23 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>30秒)、前景起播限12秒、闲置连线15秒、不自动降画质、自动重试不停）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)）\n");
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
         b.append("清 DNS ").append(DNS_CLEARS.get()).append(" 次 / 换备用线路 ").append(LINE_SWITCHES.get()).append(" 次 / 播放失败 ").append(FAILURES.get()).append(" 次\n");
         Line l = LINES.get(curFid);
         if (l != null) b.append("目前这集：主 ").append(l.mainHost).append(" / 备 ").append(l.backupHost).append(" / 正在用 ").append(l.usingBackup ? "备用" : "主").append(" / 取地址 ").append(l.fetches).append(" 次\n");
+        b.append("\n===== 起播节点统计（这次启动以来；成功平均 / 最慢） =====\n");
+        synchronized (NODE_STATS) {
+            if (NODE_STATS.isEmpty()) b.append("（还没有起播纪录）\n");
+            for (Map.Entry<String, long[]> e : NODE_STATS.entrySet()) {
+                long[] s = e.getValue();
+                b.append(e.getKey()).append("  成功 ").append(s[0]);
+                if (s[0] > 0) b.append(String.format(java.util.Locale.US, "（平均 %.1f 秒、最慢 %.1f 秒）", s[2] / 1000.0 / s[0], s[3] / 1000.0));
+                b.append("  失败 ").append(s[1]).append('\n');
+            }
+        }
         b.append("\n===== 修补事件（最近 ").append(EVENT_MAX).append(" 条，含之前启动的） =====\n");
         synchronized (EVENTS) { for (String e : EVENTS) b.append(e).append('\n'); }
         b.append("\n===== 本 App 的 log（最近 800 行） =====\n");
