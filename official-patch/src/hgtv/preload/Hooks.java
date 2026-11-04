@@ -656,7 +656,8 @@ public final class Hooks {
                 try (java.io.FileOutputStream out = new java.io.FileOutputStream(df, false)) { out.write(keep.toString().getBytes("UTF-8")); } catch (Throwable ignored) {}
                 diagFile = df;
             }
-            nodesFile = new File(files, "hgtv-nodes.txt");
+            new File(files, "hgtv-nodes.txt").delete();   // 11-04 前的纪录被「假成功」污染（v26 记了 8 次成功），换新档重学
+            nodesFile = new File(files, "hgtv-nodes-v2.txt");
             loadNodes();
             try { appVersion = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName; } catch (Throwable ignored) {}
             boolean dns = new File(cache, "dns-v1.txt").delete();
@@ -791,6 +792,7 @@ public final class Hooks {
                 return;
             }
             FAILURES.incrementAndGet();
+            if (stage != null && (stage.contains("stall") || stage.contains("io"))) revokeIfFresh(stage);
             String fid = curFid;
             Line line = LINES.get(fid);
             ev("播放失败 stage=" + stage + " err=" + (error == null ? "-" : rootMessage(error))
@@ -864,7 +866,7 @@ public final class Hooks {
                 }
             }
             if (age < STALE_URL_MS) {
-                if (pooledReader != null) recordWait(id, true);
+                if (pooledReader != null) { recordWait(id, true); provisionalOk(readerHost(pooledReader)); }
                 return false;
             }
             lastDrop = 0;
@@ -973,8 +975,10 @@ public final class Hooks {
         if (p.rewrittenFrom != null && !ok) {
             REWRITE_OFF.put(suffixOf(p.rewrittenFrom), System.currentTimeMillis() + BAD_MS);
             ev("换节点没成功：" + p.rewrittenFrom + " → " + p.host + "，30 分钟内这一组改成直接放弃坏节点");
+        } else if (ok) {
+            provisionalOk(p.host);
         } else {
-            health(p.host, ok);
+            health(p.host, false);
         }
         return true;
     }
@@ -983,6 +987,38 @@ public final class Hooks {
     // 11-02 实测：v26-reading-videocdn302 起播 9 次 0 成功（每次卡满 16 秒），其他节点 9 次 8 成功、多数 2 秒内。
 
     private static final long BAD_MS = 30 * 60_000L;
+
+    // ───── 暂定成功：起播后播满 30 秒没卡才算节点成功；60 秒内就卡住 → 收回、记一次失败 ─────
+    // 11-04 实测：v26 起播常常 0 秒「成功」（开头在快取里），16 秒后就缓冲卡住；当成功会让它解除封锁。
+    private static final long CONFIRM_MS = 30_000L, REVOKE_MS = 60_000L;
+    private static final class Pending { final String host; final long at = System.currentTimeMillis(); Pending(String h) { host = h; } }
+    private static volatile Pending pendingOk;
+
+    static void provisionalOk(final String host) {
+        if (host == null || "?".equals(host)) return;
+        final Pending p = new Pending(host);
+        Pending old = pendingOk;
+        pendingOk = p;
+        if (old != null && old != p && System.currentTimeMillis() - old.at >= CONFIRM_MS) health(old.host, true);
+        try {
+            WATCH.schedule(() -> {
+                if (pendingOk != p) return;
+                pendingOk = null;
+                health(p.host, true);
+            }, CONFIRM_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable t) { health(host, true); }
+    }
+
+    /** 播放中卡住时呼叫：刚起播（60 秒内）的节点收回成功、记一次失败。 */
+    static void revokeIfFresh(String stage) {
+        Pending p = pendingOk;
+        if (p == null) return;
+        long age = System.currentTimeMillis() - p.at;
+        if (age >= REVOKE_MS) return;
+        pendingOk = null;
+        ev("收回起播成功：节点 " + p.host + " 起播 " + age / 1000 + " 秒后就卡住（" + stage + "），记一次失败");
+        health(p.host, false);
+    }
     /** 方案 2（把坏节点网址换成同组好节点）：11-02 实测 CDN 回 403，网址签名绑主机名，关掉。 */
     private static final boolean REWRITE_ON = false;
     private static volatile long lastSkipAt;
@@ -1140,7 +1176,12 @@ public final class Hooks {
 
     /** 插在作者「预载好的下一集直接接上播」那一处：这次换集不用等。 */
     public static void seamlessSwitch() {
-        try { addWait(0, true); } catch (Throwable ignored) {}
+        try {
+            addWait(0, true);
+            Pending p = pendingOk;   // 换到下一集了：上一集的暂定成功不再等，播够 30 秒就确认，不够就放掉
+            pendingOk = null;
+            if (p != null && System.currentTimeMillis() - p.at >= CONFIRM_MS) health(p.host, true);
+        } catch (Throwable ignored) {}
     }
 
     private static String summary() {
@@ -1457,7 +1498,7 @@ public final class Hooks {
 
     private static String report() {
         StringBuilder b = new StringBuilder();
-        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点当场重取/跳过）\n");
+        b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点当场重取/跳过、起播播满30秒才算成功）\n");
         b.append("★ ").append(summary()).append('\n');
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
