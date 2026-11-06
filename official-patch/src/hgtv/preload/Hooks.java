@@ -104,7 +104,11 @@ public final class Hooks {
     public static Object streamBefore(Object repo, String id, int quality) {
         if (repo != null) repository = repo;   // 修补版：预载关着也要记下内容仓库（失败时清它快取的播放地址）
         if (id != null) { FETCHED_AT.put(id, System.currentTimeMillis()); if (FETCHED_AT.size() > 200) FETCHED_AT.clear(); }
-        if (!Boolean.TRUE.equals(REFETCHING.get())) LAST_CALL.set(new Object[]{repo, id, quality});
+        if (!Boolean.TRUE.equals(REFETCHING.get())) {
+            Object[] ex = STREAM_EXTRA.get();
+            STREAM_EXTRA.remove();
+            LAST_CALL.set(ex == null ? new Object[]{repo, id, quality} : new Object[]{repo, id, quality, ex[0], ex[1]});
+        }
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
             STREAM_CALL.set(new Object[]{repo, id, quality, System.currentTimeMillis()});
@@ -1025,6 +1029,12 @@ public final class Hooks {
 
     // ───── 取到坏节点地址：当场重取（主 / 备轮流），拿到好节点才交给作者 ─────
     private static final ThreadLocal<Object[]> LAST_CALL = new ThreadLocal<>();
+    private static final ThreadLocal<Object[]> STREAM_EXTRA = new ThreadLocal<>();
+
+    /** 1.3.x：取地址方法多了 (long 期限, 回调物件) 两个参数，插在 streamBefore 前面先记下来，当场重取时照原样带回去。 */
+    public static void streamExtra(long a, Object b) {
+        if (!Boolean.TRUE.equals(REFETCHING.get())) STREAM_EXTRA.set(new Object[]{a, b});
+    }
     private static final ThreadLocal<Boolean> REFETCHING = new ThreadLocal<>();
     private static volatile Method fetchMethod;
     private static final int REFETCH_MAX = 5;
@@ -1039,7 +1049,8 @@ public final class Hooks {
             if (!e.getClassName().equals(repo.getClass().getName())) continue;
             for (Method c : allMethods(repo.getClass())) {
                 Class<?>[] p = c.getParameterTypes();
-                if (c.getName().equals(e.getMethodName()) && p.length == 2 && p[0] == String.class && p[1] == int.class
+                boolean shape = p.length == 2 || (p.length == 4 && p[2] == long.class && !p[3].isPrimitive());
+                if (c.getName().equals(e.getMethodName()) && shape && p[0] == String.class && p[1] == int.class
                         && resultType.isAssignableFrom(c.getReturnType()) && !Modifier.isStatic(c.getModifiers())) {
                     c.setAccessible(true); fetchMethod = c; return c;
                 }
@@ -1063,7 +1074,12 @@ public final class Hooks {
             try {
                 for (int i = 1; i <= REFETCH_MAX && System.currentTimeMillis() - start < REFETCH_BUDGET_MS; i++) {
                     Object r;
-                    try { r = m.invoke(call[0], call[1], call[2]); }
+                    try {
+                        if (m.getParameterTypes().length == 4) {
+                            if (call.length < 5) { ev("当场重取：缺少取地址的额外参数，交给作者重取"); return; }
+                            r = m.invoke(call[0], call[1], call[2], call[3], call[4]);
+                        } else r = m.invoke(call[0], call[1], call[2]);
+                    }
                     catch (Throwable e) { ev("当场重取地址失败：" + rootMessage(e)); return; }
                     if (r == null) return;
                     String h = readerHost(r);
@@ -1419,13 +1435,15 @@ public final class Hooks {
     /** 插在作者解析 main_url 之前（参数是这一档影片的 JSONObject）。同一集重取地址时主 / 备轮流。 */
     public static void pickLine(Object video) {
         try {
-            if (!(video instanceof org.json.JSONObject)) return;
-            org.json.JSONObject o = (org.json.JSONObject) video;
-            String fid = o.optString("file_id", "");
-            if (fid.isEmpty()) fid = o.optString("file_hash", "");
-            String main = o.optString("main_url", "");
+            // 1.2.x 用 org.json.JSONObject；1.3.x 作者换成自己的 JSON 类（里面是一个 HashMap），两种都支援。
+            final org.json.JSONObject jo = video instanceof org.json.JSONObject ? (org.json.JSONObject) video : null;
+            final Map<Object, Object> mo = jo == null ? jsonMap(video) : null;
+            if (jo == null && mo == null) return;
+            String fid = jstr(jo, mo, "file_id");
+            if (fid.isEmpty()) fid = jstr(jo, mo, "file_hash");
+            String main = jstr(jo, mo, "main_url");
             // 平台的 main_url / backup_url_1 是加密字串（作者用 key_seed 解），这里不解，直接把备用那串放进 main_url 让作者照常解。
-            String backupRaw = o.optString("backup_url_1", "");
+            String backupRaw = jstr(jo, mo, "backup_url_1");
             String backup = plainUrl(backupRaw);
             long now = System.currentTimeMillis();
             Line l = LINES.get(fid);
@@ -1438,7 +1456,7 @@ public final class Hooks {
             boolean preferBackup = now < preferBackupUntil;
             boolean wantBackup = ((l.fetches % 2 == 0) != preferBackup) && !backupRaw.isEmpty() && !backupRaw.equals(main);
             if (wantBackup) {
-                o.put("main_url", backupRaw);
+                if (jo != null) jo.put("main_url", backupRaw); else mo.put("main_url", backupRaw);
                 l.usingBackup = true;
                 LINE_SWITCHES.incrementAndGet();
                 ev("线路 第" + l.fetches + "次取地址 → 备用 " + l.backupHost + (preferBackup && l.fetches == 1 ? "（主线路最近失败过，先用备用）" : "（主 " + l.mainHost + "）"));
@@ -1447,6 +1465,26 @@ public final class Hooks {
                 if (l.fetches > 1) ev("线路 第" + l.fetches + "次取地址 → 主 " + l.mainHost);
             }
         } catch (Throwable t) { log("pickLine failed: " + rootMessage(t)); }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Object, Object> jsonMap(Object o) {
+        if (o == null) return null;
+        try {
+            for (Field f : allFields(o.getClass())) {
+                if (Modifier.isStatic(f.getModifiers()) || !Map.class.isAssignableFrom(f.getType())) continue;
+                f.setAccessible(true);
+                Object v = f.get(o);
+                if (v instanceof Map && ((Map<?, ?>) v).containsKey("main_url")) return (Map<Object, Object>) v;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static String jstr(org.json.JSONObject jo, Map<Object, Object> mo, String k) {
+        Object v = jo != null ? jo.opt(k) : mo.get(k);
+        String s = v == null ? "" : String.valueOf(v);
+        return "null".equals(s) ? "" : s;
     }
 
     /** 平台的网址可能是明文、带 \/ 跳脱，或 base64。统一转成明文网址；转不了就回传空字串。 */
