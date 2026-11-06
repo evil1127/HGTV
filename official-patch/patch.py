@@ -60,6 +60,16 @@ def find_methods(files, params, ret, body_needle=None):
     return found
 
 
+def find_methods_prefix(files, prefix, ret, body_needle=None):
+    found = []
+    for path, text in files.items():
+        for m in METHOD_RE.finditer(text):
+            flags, name, desc, rtype, body = m.groups()
+            if desc.startswith(prefix) and rtype == ret and (body_needle is None or body_needle in body):
+                found.append((path, name, "static" in flags.split(), m.start(), m.end()))
+    return found
+
+
 def first_code_index(lines):
     """方法体里第一条指令 / 标签的位置（跳过 .locals、.param、.annotation 等指令块）。"""
     depth = None
@@ -112,9 +122,9 @@ def tune_stall_recovery(files):
     - 「缓冲停止前进」看门狗：30 秒 → 10 秒，触发后官方会清连线池并在原位置重载。
     找不到就只警告，不影响出包。"""
     timeout_re = re.compile(
-        r"(const-wide/16 (v\d+), )0x(?:8|f)(\s+invoke-virtual \{[^}]+\}, (L[^;]+;)->b\(J\)V\s+)"
-        r"(const-wide/16 (v\d+), )0x1e(\s+invoke-virtual \{[^}]+\}, \4->d\(J\)V\s+)"
-        r"(const-wide/16 (v\d+), )0x2d(\s+invoke-virtual \{[^}]+\}, \4->a\(J\)V)")
+        r"(const-wide/16 (v\d+), )0x(?:8|f)(\s+invoke-virtual \{[^}]+\}, (L[^;]+;)->b\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x1e(\s+invoke-virtual \{[^}]+\}, \4->d\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x2d(\s+invoke-virtual \{[^}]+\}, \4->a\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V)")
     clients = 0
     for path, text in list(files.items()):
         new, n = timeout_re.subn(lambda m: m.group(1) + "0x6" + m.group(3) + m.group(5) + "0x8" + m.group(7) + m.group(8) + "0x19" + m.group(10), text)
@@ -232,7 +242,7 @@ def add_fix_hooks(files):
     report(ok, "播放失败时清这一集的伺服器 DNS / 未完成暂存；连续失败清全部" + ("" if ok else f"：失败上报方法找到 {len(hits)} 个"))
 
     # 4. 主 / 备线路轮替：解析 main_url 之前
-    pick_re = re.compile(r'(\n(\s*)const-string (v\d+), "main_url"\s+invoke-static \{(v\d+), \3\}, L[^;]+;->\w+\(Lorg/json/JSONObject;Ljava/lang/String;\)Ljava/lang/String;)')
+    pick_re = re.compile(r'(\n(\s*)const-string (v\d+), "main_url"\s+invoke-static \{(v\d+), \3\}, L[^;]+;->\w+\(L[^;]+;Ljava/lang/String;\)Ljava/lang/String;)')
     hits = 0
     for path, text in list(files.items()):
         if "/novel/player/video_model/v1/" not in text:
@@ -244,7 +254,7 @@ def add_fix_hooks(files):
 
     # 5. 认出内容仓库：所有 (String, int) -> StreamInfo 的非静态方法（取地址 / 读快取地址）最前面
     stream_cls = find_class_by_string(files, "StreamInfo(url=")
-    caps = method_bodies(files, lambda p, x, m: "static" not in m.group(1).split() and m.group(3) == "Ljava/lang/String;I" and m.group(4) == stream_cls)
+    caps = method_bodies(files, lambda p, x, m: "static" not in m.group(1).split() and m.group(3).startswith("Ljava/lang/String;I") and m.group(4) == stream_cls)
     for path, m in sorted(caps, key=lambda c: -c[1].start()):
         fresh = [mm for mm in METHOD_RE.finditer(files[path]) if mm.start() == m.start()]
         if fresh:
@@ -305,6 +315,9 @@ def tune_pool(files):
     缓冲加大后整集很早就载完，连线闲置一两分钟会被 CDN / 路由默默断掉；下一集再拿这条死连线就卡到逾时。
     实测：切集第一下常卡满 25 秒，清掉连线池后立刻就好。这里让闲置连线 15 秒就关，下一集一定开新连线。"""
     hits = method_bodies(files, lambda p, x, m: m.group(2) == "<init>" and '" ConnectionPool"' in m.group(5) and "TimeUnit;->MINUTES" in m.group(5))
+    if not hits:   # 1.3.x：OkHttp 换版本，连线池建构子只剩 MINUTES + 5 + toNanos
+        hits = method_bodies(files, lambda p, x, m: m.group(2) == "<init>" and m.group(3) == "I" and "TimeUnit;->MINUTES" in m.group(5)
+                             and "->toNanos(J)J" in m.group(5) and re.search(r"const-wide/16 v\d+, 0x5\n", m.group(5)) and "Ljava/util/ArrayDeque;" in m.group(5))
     ok = False
     if len(hits) == 1:
         path, m = hits[0]
@@ -382,6 +395,8 @@ def auto_retry_forever(files):
                 text = text[:m.start(5)] + nb + text[m.end(5):]
                 path.write_text(text, encoding="utf-8"); files[path] = text
                 ok1 = True
+    if not ok1:
+        ok1 = _auto_retry_13(files)
     hits = method_bodies(files, lambda p, x, m: "Transport dead" in m.group(5) and "\\u6309\\u786e\\u5b9a\\u952e\\u91cd\\u8bd5" in m.group(5))
     if len(hits) == 1:
         path, m = hits[0]
@@ -391,8 +406,65 @@ def auto_retry_forever(files):
             text = text[:m.start(5)] + nb + text[m.end(5):]
             path.write_text(text, encoding="utf-8"); files[path] = text
             ok2 = True
+    if not ok2:
+        ok2 = _giveup_limit_13(files)
     report(ok1 and ok2, "自动重试不停（不用手动按重试；每次等 2 秒；重取地址上限 4 → 30 次）" + ("" if ok1 and ok2 else f"：自动重试计数 {'✓' if ok1 else '✗'}、重取上限 {'✓' if ok2 else '✗'}"))
 
+
+
+def _auto_retry_13(files):
+    """1.3.x：自动重试计数在「网络已断开…」那个方法里（iget-object 计数物件 / iget 计数 / const 3），等待秒数另外放在一个回传 Long 的方法。"""
+    net_msg = "\\u7f51\\u7edc\\u5df2\\u65ad\\u5f00\\uff0c\\u8054\\u7f51\\u540e\\u81ea\\u52a8\\u7eed\\u64ad"
+    hits = method_bodies(files, lambda p, x, m: net_msg in m.group(5))
+    ok_clamp = False
+    if len(hits) == 1:
+        path, m = hits[0]
+        pat = re.compile(r"\n(\s*)iget-object (v\d+), (v\d+), (L[^;]+;)->(\w+):(L[^;]+;)\n(\s*\n\s*)iget \2, \2, \6->(\w+):I\n(\s*\n\s*)const/4 (v\d+), 0x3\n")
+        found = pat.findall(m.group(5))
+        if len(found) == 1:
+            def rep(mm):
+                ind, a, s, cls, f, ocls, s1, cnt, s2, c = mm.groups()
+                field = ocls + "->" + cnt + ":I"
+                return ("\n" + ind + "iget-object " + a + ", " + s + ", " + cls + "->" + f + ":" + ocls + "\n"
+                        + "\n" + ind + "iget " + c + ", " + a + ", " + field + "\n"
+                        + "\n" + ind + "add-int/lit8 " + c + ", " + c + ", -0x3\n"
+                        + "\n" + ind + "if-ltz " + c + ", :hgtv_retry_ok\n"
+                        + "\n" + ind + "const/4 " + c + ", 0x2\n"
+                        + "\n" + ind + "iput " + c + ", " + a + ", " + field + "\n"
+                        + "\n" + ind + ":hgtv_retry_ok\n"
+                        + s1 + "iget " + a + ", " + a + ", " + field + "\n" + s2 + "const/4 " + c + ", 0x3\n")
+            nb = pat.sub(rep, m.group(5), count=1)
+            text = files[path]
+            text = text[:m.start(5)] + nb + text[m.end(5):]
+            path.write_text(text, encoding="utf-8"); files[path] = text
+            ok_clamp = True
+    dl = method_bodies(files, lambda p, x, m: m.group(4) == "Ljava/lang/Long;" and m.group(3) == "" and "[Ljava/lang/Long;" in m.group(5)
+                       and all(re.search(r"const-wide/16 v\d+, 0x" + v + r"\n", m.group(5)) for v in ("bb8", "1770", "2ee0")))
+    ok_delay = False
+    if len(dl) == 1:
+        path, m = dl[0]
+        nb, nd = re.subn(r"(const-wide/16 v\d+, )0x(bb8|1770|2ee0)\n", r"\g<1>0x7d0\n", m.group(5))
+        if nd == 3:
+            text = files[path]
+            text = text[:m.start(5)] + nb + text[m.end(5):]
+            path.write_text(text, encoding="utf-8"); files[path] = text
+            ok_delay = True
+    return ok_clamp and ok_delay
+
+
+def _giveup_limit_13(files):
+    """1.3.x：放弃（GiveUpRecommend）的门槛在重试政策里：计数 +1 后 > 3 就放弃 → 改成 > 30。"""
+    gp = [p for p, x in files.items() if '"GiveUpRecommend"' in x]
+    if len(gp) != 1:
+        return False
+    gcls = class_name(files[gp[0]])
+    pat = re.compile(r"const/4 (\w+), 0x3(\n\s*\n\s*if-le \w+, \1, :cond_\w+\n\s*\n\s*sget-object \1, " + re.escape(gcls) + r"->)")
+    n_total = 0
+    for path, text in list(files.items()):
+        new, n = pat.subn(r"const/16 \1, 0x1e\2", text)
+        if n:
+            path.write_text(new, encoding="utf-8"); files[path] = new; n_total += n
+    return n_total == 1
 
 
 def hook_seamless(files, reader_path):
@@ -454,7 +526,8 @@ def main():
     detail_cls = find_class_by_string(files, "Detail(series=")
     print(f"StreamInfo={stream_cls} Range={range_cls} Detail={detail_cls}")
 
-    stream = find_methods(files, "Ljava/lang/String;I", stream_cls, '"spade_a"')
+    # 1.3.x 起取地址的方法多了参数（例如 (String, int, long, 回调)），只要求开头是 (String, int)
+    stream = [s for s in find_methods_prefix(files, "Ljava/lang/String;I", stream_cls, '"spade_a"')]
     ranges = find_methods(files, "JJ", range_cls, '"https://novel.snssdk.com/"')
     details = find_methods(files, "Ljava/lang/String;", detail_cls)
     if len(stream) != 1 or stream[0][2]:
@@ -513,6 +586,12 @@ def main():
         path.write_text(text, encoding="utf-8"); files[path] = text
         print(f"patched {path.relative_to(root)} ({len(items)} 处)")
 
+    # 1.3.x：取地址方法多了 (long, 物件) 参数 → 先记下来，当场重取时照原样带回去
+    sp, sname = stream[0][0], stream[0][1]
+    sm = [mm for mm in METHOD_RE.finditer(files[sp]) if mm.group(2) == sname and mm.group(3).startswith("Ljava/lang/String;I") and mm.group(4) == stream_cls]
+    if len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IJL[^;]+;", sm[0].group(3)):
+        insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p5}, " + HOOKS + "->streamExtra(JLjava/lang/Object;)V")
+        print("stream extra args captured")
     tune_stall_recovery(files)
     tune_buffer(files)
     add_fix_hooks(files)
