@@ -122,12 +122,13 @@ def tune_stall_recovery(files):
     - 「缓冲停止前进」看门狗：30 秒 → 10 秒，触发后官方会清连线池并在原位置重载。
     找不到就只警告，不影响出包。"""
     timeout_re = re.compile(
-        r"(const-wide/16 (v\d+), )0x(?:8|f)(\s+invoke-virtual \{[^}]+\}, (L[^;]+;)->b\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V\s+)"
-        r"(const-wide/16 (v\d+), )0x1e(\s+invoke-virtual \{[^}]+\}, \4->d\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V\s+)"
-        r"(const-wide/16 (v\d+), )0x2d(\s+invoke-virtual \{[^}]+\}, \4->a\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V)")
+        r"(const-wide/16 (v\d+), )0x(8|f|3)(\s+invoke-virtual \{[^}]+\}, (L[^;]+;)->b\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x1e(\s+invoke-virtual \{[^}]+\}, \5->d\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x2d(\s+invoke-virtual \{[^}]+\}, \5->a\(J(?:Ljava/util/concurrent/TimeUnit;)?\)V)")
     clients = 0
     for path, text in list(files.items()):
-        new, n = timeout_re.subn(lambda m: m.group(1) + "0x6" + m.group(3) + m.group(5) + "0x8" + m.group(7) + m.group(8) + "0x19" + m.group(10), text)
+        # 连线逾时：作者原本 3 秒的就保留 3 秒（1.3.x 影片用的那支），其余改 6 秒；读取 8 秒、整个请求 25 秒
+        new, n = timeout_re.subn(lambda m: m.group(1) + ("0x3" if m.group(3) == "3" else "0x6") + m.group(4) + m.group(6) + "0x8" + m.group(8) + m.group(9) + "0x19" + m.group(11), text)
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
     report(clients > 0, f"影片连线逾时缩短（{clients} 处）" if clients else "影片连线逾时缩短：没找到逾时设定")
