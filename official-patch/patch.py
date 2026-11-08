@@ -260,7 +260,11 @@ def add_fix_hooks(files):
         new, n = pick_re.subn(lambda m: "\n" + m.group(2) + "invoke-static/range {" + m.group(4) + " .. " + m.group(4) + "}, " + HOOKS + "->pickLine(Ljava/lang/Object;)V\n" + m.group(1), text)
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; hits += n
-    report(hits == 1, "主线路 / 备用线路（backup_url_1）轮替" + ("" if hits == 1 else f"：解析 main_url 的位置找到 {hits} 个"))
+    if hits == 0 and any('"backup_urls"' in x and '"url_list"' in x and '"main_url"' in x for x in files.values()):
+        # 1.3.5.1 起作者把 main_url / backup_url / backup_url_1 / backup_url_2 / backup_urls / url_list 全收进一个清单，读取器逐一试
+        report(True, "主线路 / 备用线路：作者已内建多个备用网址逐一试，不需要再轮替")
+    else:
+        report(hits == 1, "主线路 / 备用线路（backup_url_1）轮替" + ("" if hits == 1 else f"：解析 main_url 的位置找到 {hits} 个"))
 
     # 5. 认出内容仓库：所有 (String, int) -> StreamInfo 的非静态方法（取地址 / 读快取地址）最前面
     stream_cls = find_class_by_string(files, "StreamInfo(url=")
@@ -539,6 +543,12 @@ def main():
     # 1.3.x 起取地址的方法多了参数（例如 (String, int, long, 回调)），只要求开头是 (String, int)
     stream = [s for s in find_methods_prefix(files, "Ljava/lang/String;I", stream_cls, '"spade_a"')]
     ranges = find_methods(files, "JJ", range_cls, '"https://novel.snssdk.com/"')
+    range_hook = True
+    if not ranges:
+        # 1.3.5.1 起：作者的读取器会逐一试多个网址，分段读取变成 (网址, long, long)。
+        # 旧的「预载」模块已经关掉，这个连接点只是用来认出读取器类别，不用挂勾。
+        ranges = find_methods(files, "Ljava/lang/String;JJ", range_cls, '"https://novel.snssdk.com/"')
+        range_hook = False
     details = find_methods(files, "Ljava/lang/String;", detail_cls)
     if len(stream) != 1 or stream[0][2]:
         die(f"取播放地址的方法应恰好 1 个且非静态，实际：{[(s[1], s[2]) for s in stream]}")
@@ -572,7 +582,7 @@ def main():
         "invoke-static/range {{{r} .. {r}}}, " + HOOKS + "->streamAfter(Ljava/lang/Object;)V",
         "hgtv_preload_stream_miss"))
     p, name, _, s, e = ranges[0]
-    plans.append((p, s, e,
+    if range_hook: plans.append((p, s, e,
         "invoke-static/range {{p0 .. p4}}, " + HOOKS + "->rangeBefore(Ljava/lang/Object;JJ)Ljava/lang/Object;\n"
         "move-result-object {t}\n"
         "if-eqz {t}, :{label}\n"
