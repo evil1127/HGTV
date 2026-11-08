@@ -107,7 +107,10 @@ public final class Hooks {
         if (!Boolean.TRUE.equals(REFETCHING.get())) {
             Object[] ex = STREAM_EXTRA.get();
             STREAM_EXTRA.remove();
-            LAST_CALL.set(ex == null ? new Object[]{repo, id, quality} : new Object[]{repo, id, quality, ex[0], ex[1]});
+            Object[] call = new Object[3 + (ex == null ? 0 : ex.length)];
+            call[0] = repo; call[1] = id; call[2] = quality;
+            if (ex != null) System.arraycopy(ex, 0, call, 3, ex.length);
+            LAST_CALL.set(call);
         }
         if (!enabled || Boolean.TRUE.equals(INTERNAL.get())) return null;
         try {
@@ -1035,6 +1038,11 @@ public final class Hooks {
     public static void streamExtra(long a, Object b) {
         if (!Boolean.TRUE.equals(REFETCHING.get())) STREAM_EXTRA.set(new Object[]{a, b});
     }
+
+    /** 1.3.5：(String, int, long, 回调, List)。 */
+    public static void streamExtra(long a, Object b, Object c) {
+        if (!Boolean.TRUE.equals(REFETCHING.get())) STREAM_EXTRA.set(new Object[]{a, b, c});
+    }
     private static final ThreadLocal<Boolean> REFETCHING = new ThreadLocal<>();
     private static volatile Method fetchMethod;
     private static final int REFETCH_MAX = 5;
@@ -1049,7 +1057,8 @@ public final class Hooks {
             if (!e.getClassName().equals(repo.getClass().getName())) continue;
             for (Method c : allMethods(repo.getClass())) {
                 Class<?>[] p = c.getParameterTypes();
-                boolean shape = p.length == 2 || (p.length == 4 && p[2] == long.class && !p[3].isPrimitive());
+                boolean shape = p.length == 2 || (p.length >= 4 && p[2] == long.class);
+                for (int i = 3; shape && i < p.length; i++) if (p[i].isPrimitive()) shape = false;
                 if (c.getName().equals(e.getMethodName()) && shape && p[0] == String.class && p[1] == int.class
                         && resultType.isAssignableFrom(c.getReturnType()) && !Modifier.isStatic(c.getModifiers())) {
                     c.setAccessible(true); fetchMethod = c; return c;
@@ -1075,10 +1084,11 @@ public final class Hooks {
                 for (int i = 1; i <= REFETCH_MAX && System.currentTimeMillis() - start < REFETCH_BUDGET_MS; i++) {
                     Object r;
                     try {
-                        if (m.getParameterTypes().length == 4) {
-                            if (call.length < 5) { ev("当场重取：缺少取地址的额外参数，交给作者重取"); return; }
-                            r = m.invoke(call[0], call[1], call[2], call[3], call[4]);
-                        } else r = m.invoke(call[0], call[1], call[2]);
+                        int np = m.getParameterTypes().length;
+                        if (call.length != np + 1) { ev("当场重取：取地址参数对不上（要 " + np + " 个，记到 " + (call.length - 1) + " 个），交给作者重取"); return; }
+                        Object[] args = new Object[np];
+                        System.arraycopy(call, 1, args, 0, np);
+                        r = m.invoke(call[0], args);
                     }
                     catch (Throwable e) { ev("当场重取地址失败：" + rootMessage(e)); return; }
                     if (r == null) return;
