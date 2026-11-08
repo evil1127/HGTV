@@ -131,6 +131,15 @@ def tune_stall_recovery(files):
         new, n = timeout_re.subn(lambda m: m.group(1) + ("0x3" if m.group(3) == "3" else "0x6") + m.group(4) + m.group(6) + "0x8" + m.group(8) + m.group(9) + "0x19" + m.group(11), text)
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
+    # 1.3.5：影片那支的连线逾时沿用前面的暂存器（没有自己的 const），只认「读取 30 / 整个请求 45」
+    timeout2_re = re.compile(
+        r"(invoke-virtual \{[^}]+\}, (L[^;]+;)->b\(JLjava/util/concurrent/TimeUnit;\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x1e(\s+invoke-virtual \{[^}]+\}, \2->d\(JLjava/util/concurrent/TimeUnit;\)V\s+)"
+        r"(const-wide/16 (v\d+), )0x2d(\s+invoke-virtual \{[^}]+\}, \2->a\(JLjava/util/concurrent/TimeUnit;\)V)")
+    for path, text in list(files.items()):
+        new, n = timeout2_re.subn(lambda m: m.group(1) + m.group(3) + "0x8" + m.group(5) + m.group(6) + "0x19" + m.group(8), text)
+        if n:
+            path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
     report(clients > 0, f"影片连线逾时缩短（{clients} 处）" if clients else "影片连线逾时缩短：没找到逾时设定")
 
     stall_msg = "\\u64ad\\u653e\\u4e2d\\u7f13\\u51b2\\u505c\\u6b62\\u524d\\u8fdb 30 \\u79d2"
@@ -592,7 +601,12 @@ def main():
     sm = [mm for mm in METHOD_RE.finditer(files[sp]) if mm.group(2) == sname and mm.group(3).startswith("Ljava/lang/String;I") and mm.group(4) == stream_cls]
     if len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IJL[^;]+;", sm[0].group(3)):
         insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p5}, " + HOOKS + "->streamExtra(JLjava/lang/Object;)V")
-        print("stream extra args captured")
+        print("stream extra args captured (J,L)")
+    elif len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IJL[^;]+;L[^;]+;", sm[0].group(3)):   # 1.3.5：再多一个 List
+        insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p6}, " + HOOKS + "->streamExtra(JLjava/lang/Object;Ljava/lang/Object;)V")
+        print("stream extra args captured (J,L,L)")
+    elif len(sm) == 1 and sm[0].group(3) != "Ljava/lang/String;I":
+        report(False, "当场重取：取地址方法参数是 " + sm[0].group(3) + "，没认出来")
     tune_stall_recovery(files)
     tune_buffer(files)
     add_fix_hooks(files)
