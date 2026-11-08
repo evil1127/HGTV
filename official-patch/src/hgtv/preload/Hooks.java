@@ -1096,6 +1096,14 @@ public final class Hooks {
         try {
             String host = readerHost(result);
             firstSeen(host);
+            // 1.3.5.1 起同一批地址里有好几个备用网址：先在这批里重新排序（好节点排前面、慢节点排最后），不用多打一次接口
+            String moved = reorderUrls(result, host);
+            if (moved != null) {
+                ev("取到坏节点地址，改用同一批里的 " + moved.replace(".qznovelvod.com", "") + "（慢节点 " + host.replace(".qznovelvod.com", "") + " 排到最后，不用重抓）");
+                Osd.problem("拿到慢節點 " + Osd.host(host), "改用同一批的備用網址 " + Osd.host(moved));
+                Osd.ok("已換好（不用重抓）");
+                return;
+            }
             if (!isBad(host)) return;
             Object[] call = LAST_CALL.get();
             if (call == null || call[0] == null || call[1] == null) return;
@@ -1132,6 +1140,59 @@ public final class Hooks {
                 Osd.problem("拿到慢節點 " + Osd.host(host), "當場重抓 " + REFETCH_MAX + " 次都是慢節點，交給 App 自動重試");
             } finally { REFETCHING.remove(); }
         } catch (Throwable t) { log("refetchIfBad failed: " + rootMessage(t)); }
+    }
+
+    /**
+     * 串流资讯里「主网址（String）＋ 备用网址清单（List<String>）」重新排序：
+     * 不是坏节点的排前面、坏节点排最后（同一类里维持原顺序）。
+     * 主网址是坏节点、而清单里有好节点 → 把好节点换成主网址，回传它的主机名；其他情况回传 null。
+     */
+    private static String reorderUrls(Object result, String mainHost) {
+        try {
+            Field mainF = null, listF = null;
+            String main = null;
+            List<?> alts = null;
+            for (Field f : allFields(result.getClass())) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                Object v = f.get(result);
+                if (mainF == null && v instanceof String && ((String) v).startsWith("http")) { mainF = f; main = (String) v; }
+                else if (listF == null && v instanceof List && !((List<?>) v).isEmpty()) {
+                    boolean urls = true;
+                    for (Object o : (List<?>) v) if (!(o instanceof String) || !((String) o).startsWith("http")) { urls = false; break; }
+                    if (urls) { listF = f; alts = (List<?>) v; }
+                }
+            }
+            if (mainF == null || listF == null) return null;
+            List<String> all = new ArrayList<>();
+            all.add(main);
+            for (Object o : alts) if (!all.contains(o)) all.add((String) o);
+            List<String> good = new ArrayList<>(), bad = new ArrayList<>();
+            StringBuilder seen = new StringBuilder();
+            for (String u : all) {
+                String h = hostOfUrl(u);
+                firstSeen(h);
+                if (seen.length() > 0) seen.append("、");
+                seen.append(h.replace(".qznovelvod.com", ""));
+                (isBad(h) ? bad : good).add(u);
+            }
+            if (bad.isEmpty()) return null;                       // 都是好节点，不用动
+            String newMain = isBad(mainHost) && !good.isEmpty() ? good.get(0) : main;
+            List<String> order = new ArrayList<>();
+            for (String u : good) if (!u.equals(newMain)) order.add(u);
+            for (String u : bad) if (!u.equals(newMain)) order.add(u);
+            listF.set(result, order);
+            if (newMain.equals(main)) {
+                ev("同一批地址（" + seen + "）：慢节点排到最后");
+                return null;
+            }
+            mainF.set(result, newMain);
+            return hostOfUrl(newMain);
+        } catch (Throwable t) { log("reorderUrls failed: " + rootMessage(t)); return null; }
+    }
+
+    private static String hostOfUrl(String u) {
+        try { String h = new java.net.URI(u).getHost(); return h == null ? "?" : h; } catch (Throwable t) { return "?"; }
     }
 
     private static void copyFields(Object from, Object to) throws IllegalAccessException {
