@@ -664,9 +664,13 @@ public final class Hooks {
                 diagFile = df;
             }
             new File(files, "hgtv-nodes.txt").delete();   // 11-04 前的纪录被「假成功」污染（v26 记了 8 次成功），换新档重学
+            Osd.init(app, files);
             nodesFile = new File(files, "hgtv-nodes-v2.txt");
             loadNodes();
-            try { appVersion = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName; } catch (Throwable ignored) {}
+            try {
+                android.content.pm.PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+                appVersion = pi.versionName + "（安装于 " + new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.ROOT).format(new java.util.Date(pi.lastUpdateTime)) + "）";
+            } catch (Throwable ignored) {}
             boolean dns = new File(cache, "dns-v1.txt").delete();
             // 作者把「播放地址（url-）、影片开头（head-）、索引（idx-）」都存在 playback-v1，重开 App 也照用。
             // 地址过期 / 节点坏掉 / 开头档坏掉时会一直卡在同一秒（#21：要清缓存才好）。启动时整个清掉。
@@ -804,6 +808,7 @@ public final class Hooks {
             Line line = LINES.get(fid);
             ev("播放失败 stage=" + stage + " err=" + (error == null ? "-" : rootMessage(error))
                     + " 线路=" + (line == null ? "?" : (line.usingBackup ? "备用 " : "主 ") + line.current()));
+            Osd.problem(osdProblem(stage, error), "自動重試（2 秒後，主／備線路輪流）");
             if (stage != null && stage.contains("prepare")) prepareFailed(error);
             if (stage == null || !(stage.contains("io") || stage.contains("prepare") || stage.contains("stall") || stage.contains("source"))) return;
             if (line != null && line.current().contains(".")) clearHost(line.current(), stage);
@@ -833,6 +838,20 @@ public final class Hooks {
                 if (times.size() >= 2) { times.clear(); clearAllDns("同一集 3 分钟内失败 2 次"); }
             }
         } catch (Throwable t) { log("onFailure hook failed: " + rootMessage(t)); }
+    }
+
+    /** 播放失败 → 画面提示的「问题」文字（繁体）。 */
+    private static String osdProblem(String stage, Throwable error) {
+        String m = error == null ? "" : rootMessage(error);
+        if (m.contains("ModelBlank") || m.contains("空响应")) return "紅果暫時不給播放地址（空回應）";
+        if (m.contains("403") || m.contains("Expired")) return "播放地址過期";
+        String s = stage == null ? "" : stage;
+        if (s.contains("stall_buffer")) return "播放中卡住（10 秒沒載入）";
+        if (s.contains("stall_frame")) return "畫面停住了";
+        if (s.contains("prepare")) return "起播失敗（" + (m.contains("Timeout") || m.contains("timed out") ? "逾時" : "連線中斷") + "）";
+        if (s.contains("decod")) return "解碼錯誤";
+        if (s.contains("io") || s.contains("source")) return "讀取影片中斷";
+        return "播放出錯（" + s + "）";
     }
 
     private static volatile long lastDrop;
@@ -979,6 +998,10 @@ public final class Hooks {
         String total = "";
         if (ok) { long w = recordWait(curPlayId, false); if (w >= 0) total = String.format(java.util.Locale.US, "，这集共等 %.1f 秒", w / 1000.0); }
         ev((ok ? "起播成功" : "起播" + how) + "：节点 " + p.host + via + " 用时 " + p.secs() + " 秒" + total);
+        if (ok) Osd.ok("開始播放（起播 " + p.secs() + " 秒）");
+        else if (how.startsWith("超过")) Osd.problem("起播超過 " + PREPARE_LIMIT_MS / 1000 + " 秒（節點 " + Osd.host(p.host) + "）", "放棄這次，重抓地址");
+        else if (how.startsWith("跳过")) Osd.problem("節點 " + Osd.host(p.host) + " 不能用", "跳過，馬上重抓地址");
+        else if (how.startsWith("中断")) Osd.problem("起播被中斷（節點 " + Osd.host(p.host) + "）", "重抓地址");
         if (p.rewrittenFrom != null && !ok) {
             REWRITE_OFF.put(suffixOf(p.rewrittenFrom), System.currentTimeMillis() + BAD_MS);
             ev("换节点没成功：" + p.rewrittenFrom + " → " + p.host + "，30 分钟内这一组改成直接放弃坏节点");
@@ -1024,6 +1047,7 @@ public final class Hooks {
         if (age >= REVOKE_MS) return;
         pendingOk = null;
         ev("收回起播成功：节点 " + p.host + " 起播 " + age / 1000 + " 秒后就卡住（" + stage + "），记一次失败");
+        Osd.problem("節點 " + Osd.host(p.host) + " 起播後 " + age / 1000 + " 秒就卡住", "記一次失敗，之後避開它");
         health(p.host, false);
     }
     /** 方案 2（把坏节点网址换成同组好节点）：11-02 实测 CDN 回 403，网址签名绑主机名，关掉。 */
@@ -1076,7 +1100,7 @@ public final class Hooks {
             Object[] call = LAST_CALL.get();
             if (call == null || call[0] == null || call[1] == null) return;
             Method m = fetchMethodOf(call[0], result.getClass());
-            if (m == null) { ev("取到坏节点 " + host + " 的地址，但找不到取地址的方法，交给作者重取"); return; }
+            if (m == null) { ev("取到坏节点 " + host + " 的地址，但找不到取地址的方法，交给作者重取"); Osd.problem("拿到慢節點 " + Osd.host(host), "無法當場重抓，交給 App 自動重試"); return; }
             long start = System.currentTimeMillis();
             StringBuilder tried = new StringBuilder(host.replace(".qznovelvod.com", ""));
             REFETCHING.set(Boolean.TRUE);
@@ -1097,12 +1121,15 @@ public final class Hooks {
                     tried.append(" → ").append(h.replace(".qznovelvod.com", ""));
                     if (!isBad(h)) {
                         copyFields(r, result);
-                        ev("取到坏节点地址，当场重取 " + i + " 次换到好节点（" + tried + "，花 "
-                                + String.format(java.util.Locale.US, "%.1f", (System.currentTimeMillis() - start) / 1000.0) + " 秒）");
+                        String secs = String.format(java.util.Locale.US, "%.1f", (System.currentTimeMillis() - start) / 1000.0);
+                        ev("取到坏节点地址，当场重取 " + i + " 次换到好节点（" + tried + "，花 " + secs + " 秒）");
+                        Osd.problem("拿到慢節點 " + Osd.host(host), "當場重抓 " + i + " 次，換到 " + Osd.host(h));
+                        Osd.ok("已換好（花 " + secs + " 秒）");
                         return;
                     }
                 }
                 ev("取到坏节点地址，当场重取 " + REFETCH_MAX + " 次都是坏节点（" + tried + "），交给作者重取");
+                Osd.problem("拿到慢節點 " + Osd.host(host), "當場重抓 " + REFETCH_MAX + " 次都是慢節點，交給 App 自動重試");
             } finally { REFETCHING.remove(); }
         } catch (Throwable t) { log("refetchIfBad failed: " + rootMessage(t)); }
     }
@@ -1142,6 +1169,7 @@ public final class Hooks {
                 if (h[0] >= need && !recentOk && h[2] <= now) {
                     h[2] = now + BAD_MS;
                     ev("认定坏节点：" + host + "（连续失败 " + h[0] + " 次、30 分钟内没成功过）→ 接下来 30 分钟避开它");
+                    Osd.action("節點 " + Osd.host(host) + " 連續失敗 " + h[0] + " 次，之後 30 分鐘避開它");
                 }
             }
         }
@@ -1204,6 +1232,7 @@ public final class Hooks {
     public static void seamlessSwitch() {
         try {
             addWait(0, true);
+            Osd.ok("下一集已接上");
             Pending p = pendingOk;   // 换到下一集了：上一集的暂定成功不再等，播够 30 秒就确认，不够就放掉
             pendingOk = null;
             if (p != null && System.currentTimeMillis() - p.at >= CONFIRM_MS) health(p.host, true);
@@ -1470,9 +1499,10 @@ public final class Hooks {
                 l.usingBackup = true;
                 LINE_SWITCHES.incrementAndGet();
                 ev("线路 第" + l.fetches + "次取地址 → 备用 " + l.backupHost + (preferBackup && l.fetches == 1 ? "（主线路最近失败过，先用备用）" : "（主 " + l.mainHost + "）"));
+                Osd.action("改用備用線路重抓地址（第 " + l.fetches + " 次）");
             } else {
                 l.usingBackup = false;
-                if (l.fetches > 1) ev("线路 第" + l.fetches + "次取地址 → 主 " + l.mainHost);
+                if (l.fetches > 1) { ev("线路 第" + l.fetches + "次取地址 → 主 " + l.mainHost); Osd.action("改用主線路重抓地址（第 " + l.fetches + " 次）"); }
             }
         } catch (Throwable t) { log("pickLine failed: " + rootMessage(t)); }
     }
@@ -1530,7 +1560,10 @@ public final class Hooks {
                         s.setSoTimeout(5_000);
                         java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
                         String first = in.readLine();
-                        String body = first != null && first.startsWith("GET /diag") ? report() : "HGTV 修补版：请开 /diag\n";
+                        String body;
+                        if (first != null && first.startsWith("GET /osd/on")) { Osd.setOn(true); body = "画面提示：已开启\n"; }
+                        else if (first != null && first.startsWith("GET /osd/off")) { Osd.setOn(false); body = "画面提示：已关闭\n"; }
+                        else body = first != null && first.startsWith("GET /diag") ? report() : "HGTV 修补版：请开 /diag\n";
                         byte[] bytes = body.getBytes("UTF-8");
                         java.io.OutputStream out = s.getOutputStream();
                         out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: " + bytes.length + "\r\n\r\n").getBytes("UTF-8"));
@@ -1549,6 +1582,7 @@ public final class Hooks {
         b.append("HGTV 修补版诊断（修补项：DNS/暂存清理(只清该集)、主备轮流、起播前换新地址(>5分钟)、前景起播限16秒、闲置连线15秒、不自动降画质、自动重试不停(每2秒)、坏节点当场重取/跳过、起播播满30秒才算成功）\n");
         b.append("★ ").append(summary()).append('\n');
         b.append("线路偏好：").append(System.currentTimeMillis() < preferBackupUntil ? "先用备用（主线路最近失败）" : "先用主线路").append("  目前起播集数 ").append(curPlayId).append('\n');
+        b.append("画面提示：").append(Osd.state()).append('\n');
         b.append("版本 ").append(appVersion).append("  装置 ").append(android.os.Build.MODEL).append(" Android ").append(android.os.Build.VERSION.RELEASE).append('\n');
         b.append("现在 ").append(new java.util.Date()).append("  已运行 ").append((System.currentTimeMillis() - STARTED) / 60_000L).append(" 分钟\n");
         b.append("清 DNS ").append(DNS_CLEARS.get()).append(" 次 / 换备用线路 ").append(LINE_SWITCHES.get()).append(" 次 / 播放失败 ").append(FAILURES.get()).append(" 次\n");
