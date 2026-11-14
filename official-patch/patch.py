@@ -542,6 +542,18 @@ def main():
 
     # 1.3.x 起取地址的方法多了参数（例如 (String, int, long, 回调)），只要求开头是 (String, int)
     stream = [s for s in find_methods_prefix(files, "Ljava/lang/String;I", stream_cls, '"spade_a"')]
+    if not stream:
+        # 1.3.7.1 起：含 "spade_a" 的本体搬进静态工具方法（第一个参数是内容仓库），
+        # 外层的 (String, int, 物件, List) 实例方法只是转呼叫它 → 挂在外层实例方法上。
+        cores = []
+        for path, text in files.items():
+            for m in METHOD_RE.finditer(text):
+                if m.group(4) == stream_cls and '"spade_a"' in m.group(5) and "static" in m.group(1).split():
+                    cores.append(f"{class_name(text)}->{m.group(2)}({m.group(3)}){m.group(4)}")
+        if cores:
+            stream = [s for s in find_methods_prefix(files, "Ljava/lang/String;I", stream_cls)
+                      if not s[2] and any(c in files[s[0]][s[3]:s[4]] for c in cores)]
+            print(f"stream core (static)={cores}")
     ranges = find_methods(files, "JJ", range_cls, '"https://novel.snssdk.com/"')
     range_hook = True
     if not ranges:
@@ -615,6 +627,9 @@ def main():
     elif len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IJL[^;]+;L[^;]+;", sm[0].group(3)):   # 1.3.5：再多一个 List
         insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p6}, " + HOOKS + "->streamExtra(JLjava/lang/Object;Ljava/lang/Object;)V")
         print("stream extra args captured (J,L,L)")
+    elif len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IL[^;]+;L[^;]+;", sm[0].group(3)):   # 1.3.7.1：(String, int, 播放物件, List)
+        insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p4}, " + HOOKS + "->streamExtraObj(Ljava/lang/Object;Ljava/lang/Object;)V")
+        print("stream extra args captured (L,L)")
     elif len(sm) == 1 and sm[0].group(3) != "Ljava/lang/String;I":
         report(False, "当场重取：取地址方法参数是 " + sm[0].group(3) + "，没认出来")
     tune_stall_recovery(files)
