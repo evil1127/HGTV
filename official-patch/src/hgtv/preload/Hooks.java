@@ -1071,6 +1071,10 @@ public final class Hooks {
     public static void streamExtraObj(Object a, Object b) {
         if (!Boolean.TRUE.equals(REFETCHING.get())) STREAM_EXTRA.set(new Object[]{a, b});
     }
+    /** 1.3.8：(String, int, 播放物件, List, boolean)。 */
+    public static void streamExtraObj(Object a, Object b, boolean c) {
+        if (!Boolean.TRUE.equals(REFETCHING.get())) STREAM_EXTRA.set(new Object[]{a, b, c});
+    }
     private static final ThreadLocal<Boolean> REFETCHING = new ThreadLocal<>();
     private static volatile Method fetchMethod;
     private static final int REFETCH_MAX = 5;
@@ -1087,7 +1091,8 @@ public final class Hooks {
                 Class<?>[] p = c.getParameterTypes();
                 // 第 3 个参数起：1.3.x 是 (long, 物件…)，1.3.7.1 起是 (物件, List)，除了第 3 个可以是 long 以外都不能是基本型别
                 boolean shape = p.length == 2 || p.length >= 4;
-                for (int i = 2; shape && i < p.length; i++) if (p[i].isPrimitive() && !(i == 2 && p[i] == long.class)) shape = false;
+                // 1.3.8 起最后多一个 boolean
+                for (int i = 2; shape && i < p.length; i++) if (p[i].isPrimitive() && !(i == 2 && p[i] == long.class) && !(i == p.length - 1 && i >= 4 && p[i] == boolean.class)) shape = false;
                 if (c.getName().equals(e.getMethodName()) && shape && p[0] == String.class && p[1] == int.class
                         && resultType.isAssignableFrom(c.getReturnType()) && !Modifier.isStatic(c.getModifiers())) {
                     c.setAccessible(true); fetchMethod = c; return c;
