@@ -140,6 +140,30 @@ def tune_stall_recovery(files):
         new, n = timeout2_re.subn(lambda m: m.group(1) + m.group(3) + "0x8" + m.group(5) + m.group(6) + "0x19" + m.group(8), text)
         if n:
             path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
+    # 1.3.8：作者改成 连线 / 读取 / 写入 / 整个请求 四个逾时共用同一个暂存器，一律 20 秒（0x14）。
+    # 只改连线 6 秒、读取 8 秒，之后把暂存器还原成 20 秒（写入、整个请求和后面的程式照旧）。
+    timeout3_re = re.compile(
+        r"(sget-object (v\d+), Ljava/util/concurrent/TimeUnit;->SECONDS:Ljava/util/concurrent/TimeUnit;\s+)"
+        r"(invoke-virtual \{(v\d+), (v\d+), (v\d+), \2\}, (L[^;]+;)->b\(JLjava/util/concurrent/TimeUnit;\)V\s+)"
+        r"(invoke-virtual \{\4, \5, \6, \2\}, \7->d\(JLjava/util/concurrent/TimeUnit;\)V\s+)"
+        r"(invoke-virtual \{\4, \5, \6, \2\}, \7->e\(JLjava/util/concurrent/TimeUnit;\)V\s+)"
+        r"(invoke-virtual \{\4, \5, \6, \2\}, \7->a\(JLjava/util/concurrent/TimeUnit;\)V)")
+    for path, text in list(files.items()):
+        out, pos, n = [], 0, 0
+        for m in METHOD_RE.finditer(text):
+            body = m.group(5); hit = []
+            def rep(x):
+                r = x.group(5)
+                if not re.search(r"const-wide/16 " + r + r", 0x14\n", body): return x.group(0)
+                hit.append(1)
+                c = lambda v: f"const-wide/16 {r}, {v}\n\n    "
+                return x.group(1) + c("0x6") + x.group(3) + c("0x8") + x.group(8) + c("0x14") + x.group(9) + x.group(10)
+            nb = timeout3_re.sub(rep, body); k = len(hit)
+            if k:
+                out.append(text[pos:m.start(5)]); out.append(nb); pos = m.end(5); n += k
+        if n:
+            out.append(text[pos:]); new = "".join(out)
+            path.write_text(new, encoding="utf-8"); files[path] = new; clients += n
     report(clients > 0, f"影片连线逾时缩短（{clients} 处）" if clients else "影片连线逾时缩短：没找到逾时设定")
 
     stall_msg = "\\u64ad\\u653e\\u4e2d\\u7f13\\u51b2\\u505c\\u6b62\\u524d\\u8fdb 30 \\u79d2"
@@ -310,6 +334,14 @@ def limit_prepare(files, reader_path):
             path, m = sites[0]
             pat = re.compile(r"\n(\s*)invoke-virtual \{(v\d+)\}, " + re.escape(rcls) + "->" + re.escape(pname) + r"\(\)V\n")
             found = pat.findall(m.group(5))
+            if not found:
+                # 1.3.8：起播准备把「读取器 prepare」包进一个 lambda 类别（new 出来交给计时包装执行），改到那个类别里找
+                lam = set(re.findall(r"new-instance v\d+, (L[^;]+;)", m.group(5)))
+                cands = [(pp, mm) for pp, x in files.items() if class_name(x) in lam
+                         for mm in METHOD_RE.finditer(x) if "static" not in mm.group(1).split() and pat.search(mm.group(5))]
+                if len(cands) == 1:
+                    path, m = cands[0]
+                    found = pat.findall(m.group(5))
             detail = f"：前景呼叫点找到 {len(found)} 个"
             if len(found) == 1:
                 def rep(mm):
@@ -356,14 +388,22 @@ def hook_play_start(files, reader_path):
     if len(hits) == 1:
         path, m = hits[0]
         body = m.group(5)
-        rd = re.search(r"\n\s*iget-object (v\d+), p0, L[^;]+;->\w+:" + re.escape(rcls) + r"\n", body)
-        sid = re.search(r"\n(\s*)iget-object (v\d+), p0, L[^;]+;->\w+:Ljava/lang/String;\n", body)
+        # 1.3.8：方法开头先 move-object/from16 v1, p0，之后都用 v1 读栏位
+        al = re.match(r"\s*(?:\.locals \d+\s*)?move-object/from16 (v\d+), p0\n", body)
+        me = "(?:p0|" + al.group(1) + ")" if al else "p0"
+        rd = re.search(r"\n\s*iget-object (v\d+), " + me + r", L[^;]+;->\w+:" + re.escape(rcls) + r"\n", body)
+        sid = re.search(r"\n(\s*)iget-object (v\d+), " + me + r", L[^;]+;->\w+:Ljava/lang/String;\n", body)
         loc = re.search(r"^\s*\.locals (\d+)", body, re.M)
         detail = "：找不到读取器 / 集数 ID / .locals"
         if rd and sid and loc and rd.start() < sid.start():
             n = int(loc.group(1))
-            if n + 1 <= 15:
-                rv, ind, iv, nv = rd.group(1), sid.group(1), sid.group(2), "v" + str(n)
+            rv = rd.group(1)
+            # 读取器在读集数 ID 之前被 move-object 搬到别的暂存器时，跟着搬
+            for mv in re.finditer(r"\n\s*move-object(?:/from16)? (v\d+), (v\d+)\n", body[rd.end() - 1:sid.start() + 1]):
+                if mv.group(2) == rv: rv = mv.group(1)
+            # 暂存器：原本就 ≤ 14 个 locals，或原本就超过 15 个（参数暂存器本来就在 v16 以上），多加一个都安全
+            if (n + 1 <= 15 or n >= 16) and int(rv[1:]) <= 15 and int(sid.group(2)[1:]) <= 15 and rv != sid.group(2):
+                ind, iv, nv = sid.group(1), sid.group(2), "v" + str(n)
                 ins = (sid.group(0) + "\n" + ind + "invoke-static {" + iv + ", " + rv + "}, " + HOOKS + "->playStarting(Ljava/lang/String;Ljava/lang/Object;)Z\n"
                        + "\n" + ind + "move-result " + nv + "\n"
                        + "\n" + ind + "if-eqz " + nv + ", :hgtv_keep_reader\n"
@@ -551,9 +591,23 @@ def main():
                 if m.group(4) == stream_cls and '"spade_a"' in m.group(5) and "static" in m.group(1).split():
                     cores.append(f"{class_name(text)}->{m.group(2)}({m.group(3)}){m.group(4)}")
         if cores:
+            # 1.3.8 起：外层实例方法 → 静态 (仓库, String, int, …) → 静态本体，中间可能多一层或多层静态转呼叫。
+            # 把「回传 StreamInfo、且会呼叫已知静态方法」的静态方法一路往外收集，直到没有新的。
+            chain = list(cores)
+            while True:
+                more = []
+                for path, text in files.items():
+                    cn = class_name(text)
+                    for m in METHOD_RE.finditer(text):
+                        sig = f"{cn}->{m.group(2)}({m.group(3)}){m.group(4)}"
+                        if (m.group(4) == stream_cls and "static" in m.group(1).split() and sig not in chain
+                                and sig not in more and any(c in m.group(5) for c in chain)):
+                            more.append(sig)
+                if not more: break
+                chain += more
             stream = [s for s in find_methods_prefix(files, "Ljava/lang/String;I", stream_cls)
-                      if not s[2] and any(c in files[s[0]][s[3]:s[4]] for c in cores)]
-            print(f"stream core (static)={cores}")
+                      if not s[2] and any(c in files[s[0]][s[3]:s[4]] for c in chain)]
+            print(f"stream core (static)={cores} chain={chain[len(cores):]}")
     ranges = find_methods(files, "JJ", range_cls, '"https://novel.snssdk.com/"')
     range_hook = True
     if not ranges:
@@ -630,6 +684,9 @@ def main():
     elif len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IL[^;]+;L[^;]+;", sm[0].group(3)):   # 1.3.7.1：(String, int, 播放物件, List)
         insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p4}, " + HOOKS + "->streamExtraObj(Ljava/lang/Object;Ljava/lang/Object;)V")
         print("stream extra args captured (L,L)")
+    elif len(sm) == 1 and re.fullmatch(r"Ljava/lang/String;IL[^;]+;L[^;]+;Z", sm[0].group(3)):   # 1.3.8：(String, int, 播放物件, List, boolean)
+        insert_at_method_start(files, sp, sm[0], "invoke-static/range {p3 .. p5}, " + HOOKS + "->streamExtraObj(Ljava/lang/Object;Ljava/lang/Object;Z)V")
+        print("stream extra args captured (L,L,Z)")
     elif len(sm) == 1 and sm[0].group(3) != "Ljava/lang/String;I":
         report(False, "当场重取：取地址方法参数是 " + sm[0].group(3) + "，没认出来")
     tune_stall_recovery(files)
