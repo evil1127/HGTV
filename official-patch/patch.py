@@ -564,6 +564,27 @@ def no_quality_down(files):
     report(ok, "不自动降画质（降档预算 2 → 0，出错改用同画质重建 / 换线路重试）" + ("" if ok else "：找不到降档预算"))
 
 
+def remove_tamper_dialog(files):
+    """移除作者内建的「非正版应用」防二次打包弹窗。
+    预载版一定改了包名 / 签名，开 App 必定弹这个不可取消的框，挡住使用。
+    靠弹窗标题「非正版应用」这个固定中文字串认出那支方法（apktool 会把中文输出成 \\uXXXX），
+    直接在方法开头插 return-void 让它整支不做事。这支只负责弹窗，对播放没有任何影响。
+    - 版本里有这个弹窗 → 必须成功移除；认不出（0 支或多支）就直接失败，宁可不出包。
+    - 版本里根本没有这个弹窗 → 当作上游已拿掉，跳过。"""
+    def esc(s):
+        return "".join(f"\\u{ord(c):04x}" for c in s)
+    title = esc("非正版应用")
+    if not any(title in x for x in files.values()):
+        report(True, "防二次打包弹窗：这个版本没有，略过")
+        return
+    hits = method_bodies(files, lambda p, x, m: title in m.group(5))
+    if len(hits) != 1:
+        die(f"防二次打包弹窗：认出 {len(hits)} 支方法（预期 1 支），不敢乱改，停工")
+    path, m = hits[0]
+    insert_at_method_start(files, path, m, "return-void")
+    report(True, "已移除「非正版应用」防二次打包弹窗")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
@@ -699,6 +720,7 @@ def main():
     auto_retry_forever(files)
     hook_seamless(files, ranges[0][0])
     no_quality_down(files)
+    remove_tamper_dialog(files)
 
     # 与官方版隔离：官方把登录态 / 设备身份镜像到 /sdcard/.hgtv（重装恢复用），
     # 两个 App 共用就会把官方的登录带进预载版。预载版改用自己的目录，默认保持匿名。
